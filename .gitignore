@@ -1,0 +1,31 @@
+# --- secrets: never commit environment files ---
+.env
+.env.*
+*.env
+!.env.example.template
+
+# --- local-only projects (not part of the framework repo) ---
+/upwork-proposal-studio/
+/examples/
+/.env.example
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+
+# --- local artifacts ---
+*.db
+*.jsonl
+runs/
+
+# --- studio-specific docs (other project's design notes) ---
+agent_framework/docs/upwork_proposal_studio_*.md
+.directory

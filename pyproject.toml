@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-framework"
+version = "0.1.0"
+description = "Production-grade local Python agent framework."
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40",
+    "openai>=1.0",
+    "rich>=13",
+    "jsonschema>=4",
+    "pydantic>=2",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4", "mypy>=1.10"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.setuptools.package-data]
+agent_framework = ["py.typed"]
+
+# The framework package lives in the `agent_framework/` subdirectory of this
+# repo root. `pip install -e .` from here makes `import agent_framework` work
+# from anywhere (the studio project depends on it in editable mode).
+[tool.setuptools.packages.find]
+include = ["agent_framework*"]
