@@ -109,7 +109,7 @@ async def test_call_once_does_not_execute_tools():
         ),
     ])
     loop = _make_loop(mock)
-    result = await loop.run("Search for python", policy=LoopPolicy.once())
+    await loop.run("Search for python", policy=LoopPolicy.once())
     # Tools were NOT executed — no second LLM call.
     assert mock._call_count == 1
 

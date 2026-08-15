@@ -26,7 +26,7 @@ def test_trace_start_and_end_span():
 def test_trace_error_span():
     trace = ExecutionTrace()
     try:
-        with trace.start_span(EventType.TOOL_CALL, name="fail_tool") as span:
+        with trace.start_span(EventType.TOOL_CALL, name="fail_tool"):
             raise ValueError("test error")
     except ValueError:
         pass
@@ -172,7 +172,7 @@ def test_trace_subscribe():
 
 def test_trace_where_it_failed():
     trace = ExecutionTrace()
-    with trace.start_span(EventType.TURN, name="t1") as turn_span:
+    with trace.start_span(EventType.TURN, name="t1"):
         trace.record_event(EventType.LLM_CALL, name="llm", status=SpanStatus.OK)
         trace.record_event(
             EventType.TOOL_RESULT, name="failing_tool",

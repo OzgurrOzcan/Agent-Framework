@@ -12,7 +12,6 @@ The surface contract:
 
 from __future__ import annotations
 
-import pytest
 
 import agent_framework
 from agent_framework.core.base_agent import BaseAgent
