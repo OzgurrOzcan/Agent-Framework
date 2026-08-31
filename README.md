@@ -23,8 +23,7 @@
   <a href="#quickstart">Quickstart</a> ·
   <a href="#what-you-get">Features</a> ·
   <a href="#why-not-langchain-or-crewai">Why not LangChain?</a> ·
-  <a href="#api-surface">API</a> ·
-  <a href="#examples">Examples</a>
+  <a href="#api-surface">API</a>
 </p>
 
 ---
@@ -149,7 +148,7 @@ or passed explicitly via `ProviderConfig(api_key=...)`.
 pytest agent_framework/tests/ -q      # 202 tests, fully offline against mocked providers
 ```
 
-No key is required to run the test suite or most of the examples.
+No key is required to run the test suite.
 
 ---
 
@@ -299,8 +298,7 @@ Span types: `session`, `turn`, `llm_call`, `tool_call`, `tool_result`,
 `permission_verdict`, `interrupt`, `compaction`, `memory_read`, `memory_write`,
 `loop_guard`, `error`.
 
-For a live UI, subscribe once — that single hook is all `examples/_ui.py` uses to render
-its terminal view:
+For a live UI, subscribe once — that single hook is all a renderer needs:
 
 ```python
 unsubscribe = trace.subscribe(lambda event: print(event.name, event.duration_ms))
@@ -411,29 +409,6 @@ flowchart TD
 Everything above the adapter boundary is provider-independent. Adding a provider means
 implementing one class: `call()`, `stream()`, `denormalize_messages()`, `tool_schema()`,
 and optionally `structured()`.
-
----
-
-## Examples
-
-Runnable end-to-end scripts in [`examples/`](examples/). With no API key present they
-fall back to **mock mode** — the loop, executor, permission engine, MCP layer, and
-tracing all still run for real, so you can verify your pipeline before spending a cent.
-
-| Script | Shows | Needs a key |
-|---|---|---|
-| `00_check_setup.py` | Environment check — what's ready, what's missing | no |
-| `01_tool_calling.py` | `@tool` schema generation, the `run()` loop, `complete()`, error feedback | no |
-| `02_mcp_integration.py` | A real MCP server driving a browser, end to end | no |
-| `03_structured_output.py` | `to_json()` with Pydantic and raw jsonschema | no |
-| `04_interactive_chat.py` | Permission prompts, `ask_user`, terminal UI | yes |
-
-```bash
-python examples/00_check_setup.py
-python examples/01_tool_calling.py --mock     # force mock even with a key present
-```
-
-See [`examples/README.md`](examples/README.md) for the full walkthrough.
 
 ---
 
