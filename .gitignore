@@ -4,8 +4,7 @@
 *.env
 !.env.example.template
 
-# --- local-only projects (not part of the framework repo) ---
-/upwork-proposal-studio/
+# --- local-only, not part of the published framework ---
 /examples/
 /.env.example
 
@@ -26,6 +25,7 @@ build/
 *.jsonl
 runs/
 
-# --- internal design notes: local only, never published ---
+# --- internal notes & agent guidance: local only, never published ---
 agent_framework/docs/
+CLAUDE.md
 .directory
