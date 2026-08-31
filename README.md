@@ -446,9 +446,6 @@ suite on Python 3.11 and 3.12.
 The public API is small on purpose and intended to stay that way. Contributions are
 welcome — especially new provider adapters, since that is the whole point.
 
-- [Architecture analysis & design decisions](agent_framework/docs/framework_analiz_raporu.md)
-- [Improvement plan & changelog](agent_framework/docs/framework_iyilestirme_plani.md)
-
 ## License
 
 MIT — see [LICENSE](LICENSE).

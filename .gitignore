@@ -26,6 +26,6 @@ build/
 *.jsonl
 runs/
 
-# --- studio-specific docs (other project's design notes) ---
-agent_framework/docs/upwork_proposal_studio_*.md
+# --- internal design notes: local only, never published ---
+agent_framework/docs/
 .directory
