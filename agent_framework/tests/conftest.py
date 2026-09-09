@@ -1,6 +1,6 @@
 """Shared pytest fixtures."""
 import pytest
-from agent_framework.core.config import AgentConfig, CompactionConfig, ProviderConfig, ProviderKind
+from agent_framework.core.config import AgentConfig, CompactionConfig
 from agent_framework.core.context_manager import ContextManager
 from agent_framework.memory.short_term import ShortTermMemory
 from agent_framework.permissions.config import PermissionConfig
@@ -16,11 +16,8 @@ from agent_framework.core.loop import AgentLoop
 @pytest.fixture
 def anthropic_config() -> AgentConfig:
     return AgentConfig(
-        provider=ProviderConfig(
-            provider=ProviderKind.ANTHROPIC,
-            model="claude-opus-4-7",
-            api_key="test-key",
-        ),
+        model="claude-opus-4-7",
+        api_key="test-key",
         system_prompt="You are a test agent.",
         max_turns=10,
         stall_threshold=3,
@@ -31,11 +28,8 @@ def anthropic_config() -> AgentConfig:
 @pytest.fixture
 def openai_config() -> AgentConfig:
     return AgentConfig(
-        provider=ProviderConfig(
-            provider=ProviderKind.OPENAI,
-            model="gpt-4o",
-            api_key="test-key",
-        ),
+        model="gpt-4o",
+        api_key="test-key",
         system_prompt="You are a test agent.",
         max_turns=10,
         stall_threshold=3,

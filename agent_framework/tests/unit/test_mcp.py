@@ -58,8 +58,9 @@ def _native_tool(name: str) -> Tool:
 # ---------------------------------------------------------------------------
 
 async def test_discover_all_sync_raises_inside_running_loop():
+    """Blocking discovery cannot happen inside async code; point at the fix."""
     registry = _registry_with(_make_mock_server_client("alpha"))
-    with pytest.raises(RuntimeError, match="acreate"):
+    with pytest.raises(RuntimeError, match=r"Agent\.connect"):
         registry.discover_all_sync()
 
 

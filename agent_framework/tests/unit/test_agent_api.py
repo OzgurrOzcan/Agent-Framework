@@ -8,14 +8,15 @@ The surface contract:
   - `run_stream()` = run with a streaming transport.
   - Legacy shape-per-method API (call_once / call_with_tools / stream_once /
     stream_with_tools / stream) is gone; LoopPolicy is internal.
+  - Construction is `Agent(model_or_config, ...)`; there is no create()
+    factory and no provider enum.
 """
 
 from __future__ import annotations
 
 
 import agent_framework
-from agent_framework.core.base_agent import BaseAgent
-from agent_framework.core.config import AgentConfig, ProviderConfig, ProviderKind
+from agent_framework.core.agent import Agent
 from agent_framework.core.message import StopReason
 from agent_framework.permissions.models import PermissionCategory
 from agent_framework.providers.base import StreamChunkType, ToolChoice
@@ -24,15 +25,10 @@ from agent_framework.tests.mocks.mock_llm import MockLLMProvider, ScriptedTurn
 
 
 def make_agent(script, tools=None):
-    agent = BaseAgent.create(
-        AgentConfig(
-            provider=ProviderConfig(
-                provider=ProviderKind.ANTHROPIC,
-                model="claude-opus-5",
-                api_key="test-key",
-            ),
-            system_prompt="api surface test",
-        ),
+    agent = Agent(
+        "claude-opus-5",
+        api_key="test-key",
+        system_prompt="api surface test",
         tools=tools,
     )
     mock = MockLLMProvider(script)
@@ -199,6 +195,6 @@ def test_loop_policy_is_not_public_api():
 def test_public_surface_is_exactly_four_verbs():
     public_exec = [
         n for n in ("complete", "run", "run_stream", "to_json")
-        if hasattr(BaseAgent, n)
+        if hasattr(Agent, n)
     ]
     assert public_exec == ["complete", "run", "run_stream", "to_json"]

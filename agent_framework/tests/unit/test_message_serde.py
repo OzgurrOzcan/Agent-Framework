@@ -86,14 +86,10 @@ def test_legacy_dict_without_type_falls_back_with_warning():
 
 
 def test_checkpoint_restore_full_fidelity():
-    from agent_framework.core.base_agent import BaseAgent
-    from agent_framework.core.config import AgentConfig, ProviderConfig, ProviderKind
+    from agent_framework.core.agent import Agent
+    from agent_framework.core.config import AgentConfig
 
-    agent = BaseAgent.create(AgentConfig(
-        provider=ProviderConfig(
-            provider=ProviderKind.ANTHROPIC, model="claude-opus-5", api_key="test-key",
-        ),
-    ))
+    agent = Agent(AgentConfig(model="claude-opus-5", api_key="test-key"))
     agent.memory.short_term.append(UserMessage(content="q"))
     agent.memory.short_term.append(AssistantMessage(
         content="a",

@@ -231,7 +231,7 @@ class AgentLoop:
                                 temperature=self.config.temperature,
                                 tool_choice=self._tool_choice_for_turn(policy, state.turn),
                                 enable_caching=self.config.enable_prompt_caching,
-                                extra=self.config.provider_extra or None,
+                                extra=self.config.request_extra or None,
                             )
                         except asyncio.CancelledError:
                             raise
@@ -476,7 +476,7 @@ class AgentLoop:
                             temperature=self.config.temperature,
                             tool_choice=self._tool_choice_for_turn(policy, state.turn),
                             enable_caching=self.config.enable_prompt_caching,
-                            extra=self.config.provider_extra or None,
+                            extra=self.config.request_extra or None,
                         ):
                             yield chunk
                             ctype = chunk.type

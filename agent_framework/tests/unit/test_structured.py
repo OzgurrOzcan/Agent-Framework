@@ -9,7 +9,7 @@ from typing import Optional
 import pytest
 from pydantic import BaseModel
 
-from agent_framework.core.config import AgentConfig, ProviderConfig, ProviderKind
+from agent_framework.core.config import AgentConfig
 from agent_framework.output.schema_prep import prepare_for_strict, strip_optional_nulls
 from agent_framework.output.structured import StructuredOutputError, generate_structured
 from agent_framework.tests.mocks.mock_llm import MockLLMProvider, ScriptedTurn
@@ -23,11 +23,7 @@ class Contact(BaseModel):
 
 
 def _fake_agent(mock: MockLLMProvider):
-    config = AgentConfig(
-        provider=ProviderConfig(
-            provider=ProviderKind.ANTHROPIC, model="claude-opus-5", api_key="test-key"
-        )
-    )
+    config = AgentConfig(model="claude-opus-5", api_key="test-key")
     return SimpleNamespace(_provider=mock, config=config)
 
 
@@ -145,15 +141,12 @@ async def test_client_side_constraint_enforced():
 
 async def test_history_is_never_touched():
     """to_json must not pollute the agent's conversation history."""
-    from agent_framework.core.base_agent import BaseAgent
+    from agent_framework.core.agent import Agent
 
     config = AgentConfig(
-        provider=ProviderConfig(
-            provider=ProviderKind.ANTHROPIC, model="claude-opus-5", api_key="test-key"
-        ),
-        system_prompt="test",
+        model="claude-opus-5", api_key="test-key", system_prompt="test"
     )
-    agent = BaseAgent.create(config)
+    agent = Agent(config)
     mock = MockLLMProvider()
     mock.structured_script = [json.dumps({"name": "J", "email": "j@x.io"})]
     agent._provider = mock

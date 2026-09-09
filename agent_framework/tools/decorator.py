@@ -22,7 +22,7 @@ order): `Annotated[T, "description"]` metadata, then a Google-style
 docstring ``Args:`` section (`param: description` lines).
 
 The decorator returns a `Tool` (callable wrapper) so it can be used
-directly in a `list[Tool]` passed to `BaseAgent.create()`.
+directly in a `list[Tool]` passed to `Agent(...)`.
 """
 
 from __future__ import annotations

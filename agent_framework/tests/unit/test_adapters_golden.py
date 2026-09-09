@@ -204,7 +204,7 @@ async def test_openai_unrelated_400_is_not_swallowed(oai):
         )
 
 
-async def test_openai_provider_extra_overrides_reasoning_effort(oai):
+async def test_openai_request_extra_overrides_reasoning_effort(oai):
     adapter, client = oai
     await adapter.call(
         system="", messages=[UserMessage(content="hi")], tools=[_TOOL],

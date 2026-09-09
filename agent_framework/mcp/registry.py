@@ -63,20 +63,23 @@ class MCPServerRegistry:
         return out
 
     def discover_all_sync(self) -> list[Tool]:
-        """Synchronous convenience for `BaseAgent.create()`.
+        """Discover from synchronous code, for eager `tools=` construction:
 
-        Runs `discover_all()` in a new event loop. If an event loop is
-        already running, raises `RuntimeError` — synchronous discovery
-        cannot block inside async code; use `await BaseAgent.acreate(...)`
-        (which awaits `discover_all()`) instead.
+            agent = Agent("claude-opus-5", tools=registry.discover_all_sync())
+
+        Runs `discover_all()` in a new event loop, so it raises `RuntimeError`
+        when one is already running — blocking discovery cannot happen inside
+        async code. From async code use `await registry.discover_all()`, or
+        `await Agent.connect(config, mcp=registry)` to let the agent do it.
         """
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(self.discover_all())
         raise RuntimeError(
-            "BaseAgent.create(mcp=...) cannot discover MCP tools inside a running "
-            "event loop. Use `await BaseAgent.acreate(...)` instead."
+            "discover_all_sync() cannot run inside a running event loop. "
+            "Use `await registry.discover_all()`, or "
+            "`await Agent.connect(config, mcp=registry)`."
         )
 
     async def close_all(self) -> None:

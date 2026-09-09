@@ -1,6 +1,6 @@
 """ToolRegistry — composable collection of `Tool` objects.
 
-You can pass either `list[Tool]` or `ToolRegistry` to `BaseAgent.create()`.
+You can pass either `list[Tool]` or `ToolRegistry` to `Agent(...)`.
 The registry adds composition operators (filter, +) for advanced cases.
 """
 
