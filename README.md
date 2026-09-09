@@ -14,7 +14,7 @@
     <img src="https://github.com/OzgurrOzcan/Agent-Framework/actions/workflows/ci.yml/badge.svg" alt="CI">
   </a>
   <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12-blue" alt="Python 3.11 | 3.12">
-  <img src="https://img.shields.io/badge/tests-202%20passing-brightgreen" alt="202 tests passing">
+  <img src="https://img.shields.io/badge/tests-352%20passing-brightgreen" alt="352 tests passing">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
   <img src="https://img.shields.io/badge/typed-py.typed-informational" alt="Typed">
 </p>
@@ -41,15 +41,16 @@ And the parts that actually decide whether an agent is *production-ready* are th
 nobody wants to write twice: what stops a runaway loop, which tool may touch what, what
 the last run cost, and — when it breaks at 3am — which turn it broke on.
 
-**Agent Framework** owns exactly those parts, in ~6,500 lines of plain Python you can
+**Agent Framework** owns exactly those parts, in ~8,000 lines of plain Python you can
 read in an afternoon. Switching provider is one line:
 
 ```diff
-- provider=ProviderKind.ANTHROPIC, model="claude-opus-5"
-+ provider=ProviderKind.OPENAI,    model="gpt-5"
+- Agent("claude-opus-5", system_prompt="...", tools=[add])
++ Agent("gpt-5",         system_prompt="...", tools=[add])
 ```
 
-Nothing else changes — not your tools, not your permissions, not your traces.
+The model id names its own provider, so there is no provider argument to change.
+Nothing else changes either — not your tools, not your permissions, not your traces.
 
 ---
 
@@ -114,9 +115,9 @@ migrations into projects.
 | **Debuggability** | Errors surface deep inside framework internals | Span tree with turn, tool, args, tokens, cost, and `where_it_failed()` |
 | **Cost visibility** | Bolt-on, usually a third-party service | Built in — per model, per turn, and a hard USD budget guard |
 | **Runaway protection** | Mostly your problem | Four independent termination layers |
-| **Provider switching** | Integration package per provider | One enum value |
+| **Provider switching** | Integration package per provider | One string — the model id names its provider |
 | **Dependency weight** | Large transitive tree | 5 runtime deps: `anthropic`, `openai`, `rich`, `jsonschema`, `pydantic` |
-| **Reading the source** | Large, layered, DSL-heavy | ~6,500 lines of plain Python. No DSL, no pipe operator, no magic |
+| **Reading the source** | Large, layered, DSL-heavy | ~8,000 lines of plain Python. No DSL, no pipe operator, no magic |
 
 **And it is yours to change.** This is MIT-licensed and small enough to actually read in
 an afternoon. Clone it, add the provider your client insists on, swap the permission
@@ -141,11 +142,12 @@ pip install -e ".[dev]"      # framework + test tooling
 pip install -e ".[mcp]"      # optional: MCP server support
 ```
 
-Requires Python 3.11+. API keys are read from `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`,
-or passed explicitly via `ProviderConfig(api_key=...)`.
+Requires Python 3.11+. API keys are read from the environment variable the model's
+provider declares (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`), or passed explicitly via
+`Agent(..., api_key=...)`.
 
 ```bash
-pytest agent_framework/tests/ -q      # 202 tests, fully offline against mocked providers
+pytest agent_framework/tests/ -q      # 352 tests, fully offline against mocked providers
 ```
 
 No key is required to run the test suite.
@@ -156,35 +158,51 @@ No key is required to run the test suite.
 
 ```python
 import asyncio
-from agent_framework import (
-    BaseAgent, AgentConfig, ProviderConfig, ProviderKind,
-    tool, PermissionCategory,
-)
+from agent_framework import Agent, tool, PermissionCategory
 
 @tool(description="Add two numbers", permission=PermissionCategory.AUTO)
 async def add(a: int, b: int) -> int:
     return a + b
 
 async def main():
-    agent = BaseAgent.create(
-        AgentConfig(
-            provider=ProviderConfig(
-                provider=ProviderKind.ANTHROPIC,   # or ProviderKind.OPENAI
-                model="claude-opus-5",
-            ),
-            system_prompt="You are a helpful assistant.",
-            max_turns=6,
-            max_budget_usd=0.50,                   # hard stop, enforced by the loop
-        ),
+    agent = Agent(
+        "claude-opus-5",                 # or "gpt-5"; the id names its provider
+        system_prompt="You are a helpful assistant.",
+        max_turns=6,
+        max_budget_usd=0.50,             # hard stop, enforced by the loop
         tools=[add],
     )
 
     result = await agent.run("What is 2 + 3?")
     print(result.final_message)
-    print(agent.cost.snapshot())                   # (usd, TokenUsage)
+    print(agent.cost.snapshot())         # (usd, TokenUsage)
 
 asyncio.run(main())
 ```
+
+The model id is the only thing you must supply. `Agent(...)` takes the handful of
+settings you actually reach for; everything else lives on `AgentConfig`, which is
+frozen, validated at construction, and serializable:
+
+```python
+from agent_framework import Agent, AgentConfig, CompactionConfig
+
+config = AgentConfig(
+    model="claude-opus-5",
+    system_prompt="You are a helpful assistant.",
+    compaction=CompactionConfig(trigger_ratio=0.85),
+    request_extra={"thinking": {"type": "adaptive"}},
+)
+
+agent      = Agent(config, tools=[add])
+summariser = Agent(config, system_prompt="Summarise.", max_turns=2)   # override, no mutation
+local      = Agent("openai:llama-3.3-70b", base_url="http://localhost:8000/v1")
+deployed   = Agent(AgentConfig.from_env())      # AGENT_MODEL, AGENT_MAX_TURNS, ...
+```
+
+An unknown model id is rejected at construction with the fix in the message, so a
+typo can never reach a provider — and `"openai:<name>"` is how any OpenAI-compatible
+endpoint is addressed.
 
 `run()` never raises for operational failures. A budget stop, a turn-limit stop, or a
 provider error comes back as `result.stop_reason == StopReason.ERROR` with the exception
@@ -233,7 +251,7 @@ permissions = PermissionConfig(
     on_ask=TerminalRenderer(),                  # who answers ASK prompts
 )
 
-agent = BaseAgent.create(config, tools=[...], permissions=permissions)
+agent = Agent("claude-opus-5", tools=[...], permissions=permissions)
 ```
 
 | Category | Behaviour |
@@ -250,7 +268,7 @@ remove a deny rule or introduce an allow rule the parent doesn't have.
 
 ```python
 from agent_framework import (
-    BaseAgent, ExecutionTrace, MCPServerRegistry, MCPConnectionConfig,
+    Agent, ExecutionTrace, MCPServerRegistry, MCPConnectionConfig,
 )
 
 trace = ExecutionTrace()
@@ -262,7 +280,7 @@ registry = MCPServerRegistry(trace=trace).add(
     ),
 )
 
-agent = await BaseAgent.acreate(config, mcp=registry, trace=trace)   # async factory for MCP
+agent = await Agent.connect("claude-opus-5", mcp=registry, trace=trace)
 try:
     result = await agent.run("Summarise the newest file in /data.")
 finally:
@@ -270,9 +288,14 @@ finally:
 ```
 
 Tools arrive namespaced (`fs__read_text_file`), so two servers exposing the same tool
-name never collide. Use `acreate()` from async code — `create(mcp=...)` raises inside a
-running event loop rather than silently discovering zero tools. Always pass a `trace`:
-discovery swallows connection errors and reports them as trace events.
+name never collide.
+
+Decide where discovery happens. `await Agent.connect(...)` connects and discovers now,
+so a misconfigured server fails at start-up — what you want from a service, since
+discovery reports connection errors as trace events rather than raising, and a container
+that boots green would otherwise serve a silently reduced toolset. `Agent(..., mcp=...)`
+defers discovery to the first run instead: convenient in a script or notebook, at the
+cost of `agent.tools` being incomplete until then. Always pass a `trace`, either way.
 
 ### Observability
 
@@ -294,9 +317,19 @@ print(trace.where_it_failed())                    # the failing span chain
 SQLiteExporter("traces.db").export(trace)         # or JSON / JSONL / OTel
 ```
 
-Span types: `session`, `turn`, `llm_call`, `tool_call`, `tool_result`,
+Span types: `session`, `run`, `turn`, `llm_call`, `tool_call`, `tool_result`,
 `permission_verdict`, `interrupt`, `compaction`, `memory_read`, `memory_write`,
 `loop_guard`, `error`.
+
+The trace explains its own behaviour, because settings are recorded alongside the spans
+they caused. `session` carries the config the agent was built with — the *resolved*
+context window, the compaction thresholds, the sampling parameters, and whether the
+model was priced at all (an unpriced model records `$0.00` and silently disables
+`max_budget_usd`, which is otherwise indistinguishable from a genuinely cheap run).
+`run` carries the effective policy of one run, since `run(max_turns=3)` overrides the
+config per call: without it, a trace cannot separate "the caller capped this run" from
+"the deployed config changed", nor tell a `max_tool_rounds` cap or `complete()` apart
+from a permission wall — all three look like `tool_use` with no `tool_call` span.
 
 For a live UI, subscribe once — that single hook is all a renderer needs:
 
@@ -353,9 +386,11 @@ agent.restore(cid)                # exact rollback
 ## API surface
 
 ```python
-# construction
-agent = BaseAgent.create(config, tools=[...], permissions=..., memory=..., trace=..., pricing=...)
-agent = await BaseAgent.acreate(config, mcp=registry, tools=[...])      # required for MCP
+# construction — a model id or an AgentConfig, plus overrides
+agent = Agent("claude-opus-5", system_prompt=..., max_turns=..., max_budget_usd=...,
+              temperature=..., api_key=..., base_url=...,
+              tools=[...], permissions=..., memory=..., trace=..., pricing=...)
+agent = await Agent.connect(config, mcp=registry, tools=[...])   # discover MCP eagerly
 
 # four verbs — all async
 result = await agent.run(prompt, max_turns=..., max_tool_rounds=..., tool_choice=...)
@@ -385,7 +420,7 @@ agent.checkpoint() · agent.restore(cid)
 
 ```mermaid
 flowchart TD
-    U[Your code] --> A[BaseAgent]
+    U[Your code] --> A[Agent]
     A --> L[AgentLoop]
 
     L --> CM[ContextManager<br/>compaction · caching · token budget]
@@ -407,14 +442,32 @@ flowchart TD
 ```
 
 Everything above the adapter boundary is provider-independent. Adding a provider means
-implementing one class: `call()`, `stream()`, `denormalize_messages()`, `tool_schema()`,
-and optionally `structured()`.
+implementing one class — `call()`, `stream()`, `denormalize_messages()`, `tool_schema()`,
+and optionally `structured()` — and registering one record:
+
+```python
+from agent_framework import ProviderSpec, register_provider
+
+register_provider(ProviderSpec(
+    name="bedrock",
+    env_key="BEDROCK_API_KEY",
+    model_prefixes=("bedrock.",),          # so "bedrock.foo-1" resolves without a prefix
+    build=lambda **kw: MyBedrockAdapter(**kw),
+    context_windows=(("bedrock.", 200_000),),
+))
+
+agent = Agent("bedrock:anthropic.claude-opus-5")
+```
+
+That one record is the single source of truth for the adapter, the API-key variable, the
+model names the provider owns, and its context windows — there is no enum to extend and
+nothing else in the framework to touch.
 
 ---
 
 ## Project status
 
-`0.1.0` — the core is stable and covered by **202 tests** that run fully offline, including
+`0.1.0` — the core is stable and covered by **352 tests** that run fully offline, including
 golden-request tests that pin both providers' wire formats. CI runs lint and the full
 suite on Python 3.11 and 3.12.
 
