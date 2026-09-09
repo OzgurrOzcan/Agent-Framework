@@ -102,6 +102,27 @@ class AgentResult:
         return []
 
 
+def _policy_payload(policy: LoopPolicy, *, streaming: bool) -> dict[str, Any]:
+    """The effective shape of one run, for the RUN span.
+
+    `AgentConfig` records the defaults, but `run(max_turns=3)` overrides them
+    per call — so these values are recoverable from nowhere else. Without them
+    a trace cannot distinguish "the caller capped this run" from "the deployed
+    config changed", nor `max_tool_rounds` from a permission wall when a turn
+    requests tools and none execute.
+    """
+    choice = policy.tool_choice
+    return {
+        "max_turns": policy.max_turns,
+        # None = unlimited (bounded only by max_turns).
+        "max_tool_rounds": policy.max_tool_rounds,
+        "execute_tools": policy.execute_tools,
+        "tool_choice": choice.mode if choice is not None else None,
+        "tool_choice_name": choice.tool_name if choice is not None else None,
+        "streaming": streaming,
+    }
+
+
 class AgentLoop:
     """The core engine. One instance per agent."""
 
@@ -170,7 +191,25 @@ class AgentLoop:
     ) -> AgentResult:
         self._acquire_run()
         try:
-            return await self._run_inner(user_input, policy=policy)
+            # One RUN span per run, so every turn below it is attributable to
+            # the policy that shaped it (session = how the agent was built).
+            with self.trace.start_span(
+                EventType.RUN,
+                name="run",
+                payload=_policy_payload(policy, streaming=False),
+            ) as run_span:
+                result = await self._run_inner(user_input, policy=policy)
+                run_span.update(
+                    stop_reason=result.stop_reason.value,
+                    turns=result.state.turn,
+                    tool_rounds=result.state.tool_rounds,
+                    cost_usd=result.state.cumulative_cost_usd,
+                )
+                # The loop turns operational failures into AgentResult.error
+                # rather than raising, so the span has to be marked by hand.
+                if result.error is not None:
+                    run_span.set_error(result.error)
+                return result
         finally:
             self._running = False
 
@@ -422,8 +461,14 @@ class AgentLoop:
     ) -> AsyncIterator[StreamChunk]:
         self._acquire_run()
         try:
-            async for chunk in self._stream_inner(user_input, policy=policy):
-                yield chunk
+            with self.trace.start_span(
+                EventType.RUN,
+                name="run",
+                payload=_policy_payload(policy, streaming=True),
+            ) as run_span:
+                async for chunk in self._stream_inner(user_input, policy=policy):
+                    yield chunk
+                run_span.update(turns=self.trace.current_turn)
         finally:
             self._running = False
 

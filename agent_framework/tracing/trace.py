@@ -27,7 +27,12 @@ from agent_framework.core.message import TokenUsage
 
 
 class EventType(str, enum.Enum):
+    # How the agent was built: one per agent, carrying its config snapshot.
     SESSION = "session"
+    # How one run was shaped: one per run()/run_stream()/complete(), carrying
+    # the effective LoopPolicy. Config defaults and per-call overrides can
+    # disagree, so the run is the only place the effective values are known.
+    RUN = "run"
     TURN = "turn"
     LLM_CALL = "llm_call"
     TOOL_CALL = "tool_call"

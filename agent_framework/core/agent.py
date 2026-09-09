@@ -51,7 +51,7 @@ from agent_framework.tools.executor import ToolExecutor
 from agent_framework.tools.models import Tool
 from agent_framework.tools.registry import ToolRegistry, to_registry
 from agent_framework.tracing.cost import CostTracker, PricingTable
-from agent_framework.tracing.trace import ExecutionTrace
+from agent_framework.tracing.trace import EventType, ExecutionTrace
 
 CheckpointId = str
 
@@ -209,6 +209,8 @@ class Agent:
             summarizer_model=self.config.model,
         )
         self._checkpoints: dict[CheckpointId, dict[str, Any]] = {}
+
+        self._record_session_span()
 
         # Loop engine — one per agent.
         self._loop = AgentLoop(
@@ -399,6 +401,36 @@ class Agent:
         self._cost.total_cost_usd = ckpt.get("cost", self._cost.total_cost_usd)
 
     # ===================== internals =====================
+    def _record_session_span(self) -> None:
+        """Record how this agent was built, once, into the trace.
+
+        Without it a trace cannot explain its own behaviour: nothing else
+        records the resolved context window (so a compaction span cannot say
+        whether it fired at the configured ratio or at a silently defaulted
+        window), whether the model was priced at all (so a $0.00 run cannot be
+        told apart from an inactive budget guard), or the sampling parameters.
+
+        The API key is not part of `AgentConfig.to_dict()`, and the trace
+        redacts sensitive keys on top of that. Emitted at construction, so it
+        lands in the exported trace rather than in live subscribers, which
+        attach afterwards.
+        """
+        payload = self.config.to_dict()
+        payload.update(
+            tools=sorted(self._tools.names),
+            mcp_servers=self._mcp.names() if self._mcp is not None else [],
+            mcp_discovery=(
+                "none"
+                if self._mcp is None
+                else ("eager" if self._mcp_discovered else "lazy")
+            ),
+            # A model missing from the PricingTable records 0.0 cost and
+            # silently disables max_budget_usd — worth knowing per run.
+            pricing_resolved=self._cost.pricing.get(self.config.model) is not None,
+            framework_version=_framework_version(),
+        )
+        self._trace.record_event(EventType.SESSION, name="session", payload=payload)
+
     def _build_system_prompt(self) -> str:
         """Compose the byte-stable system prompt at session start.
 
@@ -422,6 +454,12 @@ class Agent:
             parts.append("<environment>\n" + "\n".join(env_lines) + "\n</environment>")
 
         return "\n\n".join(parts)
+
+
+def _framework_version() -> str:
+    from agent_framework import __version__
+
+    return __version__
 
 
 def _resolve_config(config: str | AgentConfig, **overrides: Any) -> AgentConfig:
