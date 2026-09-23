@@ -30,10 +30,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, Iterable
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from agent_framework.core.config import AgentConfig
 from agent_framework.core.context_manager import ContextManager
@@ -210,8 +212,11 @@ class Agent:
             session_id=self._trace.session_id,
             max_parallel=self.config.max_parallel_tools,
         )
+        # Built once: the prompt must stay byte-stable for prompt caching, and
+        # the session span fingerprints exactly this text.
+        self._system_prompt = self._build_system_prompt()
         self._context_manager = ContextManager(
-            system_prompt=self._build_system_prompt(),
+            system_prompt=self._system_prompt,
             context_window=self.config.resolved_context_window,
             response_buffer_tokens=self.config.response_buffer_tokens,
             compaction_buffer_tokens=self.config.compaction_buffer_tokens,
@@ -436,13 +441,30 @@ class Agent:
         window), whether the model was priced at all (so a $0.00 run cannot be
         told apart from an inactive budget guard), or the sampling parameters.
 
-        The API key is not part of `AgentConfig.to_dict()`, and the trace
-        redacts sensitive keys on top of that. Emitted at construction, so it
-        lands in the exported trace rather than in live subscribers, which
-        attach afterwards.
+        It records settings, never content — the convention the LLM spans
+        already follow. Traces are exported (JSONL, SQLite, OTel), so:
+
+          - the prompt is fingerprinted, not copied: a hash of the prompt
+            actually sent answers "did these two runs use the same prompt?"
+            without shipping its text to a trace store;
+          - `base_url` loses userinfo, query and fragment, which can carry
+            credentials (``user:pass@host``, ``?api-key=...``);
+          - the API key is not part of `AgentConfig.to_dict()` at all, and the
+            trace redacts sensitive keys on top of that.
+
+        Emitted at construction, so a trace passed in with subscribers
+        attached sees it live; one subscribed afterwards finds it in the
+        exported trace.
         """
         payload = self.config.to_dict()
+        payload.pop("system_prompt", None)
         payload.update(
+            agent_id=self.agent_id,
+            system_prompt_sha256=hashlib.sha256(
+                self._system_prompt.encode("utf-8")
+            ).hexdigest()[:16],
+            system_prompt_chars=len(self._system_prompt),
+            base_url=_endpoint_for_trace(self.config.base_url),
             tools=sorted(self._tools.names),
             mcp_servers=self._mcp.names() if self._mcp is not None else [],
             mcp_discovery=(
@@ -480,6 +502,30 @@ class Agent:
             parts.append("<environment>\n" + "\n".join(env_lines) + "\n</environment>")
 
         return "\n\n".join(parts)
+
+
+def _endpoint_for_trace(url: str | None) -> str | None:
+    """*url* reduced to what identifies the endpoint: scheme, host, port, path.
+
+    Userinfo, query and fragment are dropped because they are where
+    credentials hide. Anything that is not a parseable http(s) URL — the only
+    kind the SDKs accept — is replaced rather than echoed, since without a
+    scheme and host a credential can hide in what parses as the path.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        return "[unparseable url]"
+    if parts.scheme not in ("http", "https") or not host:
+        return "[unparseable url]"
+    if ":" in host:  # IPv6 literal: urlsplit strips the brackets
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _framework_version() -> str:

@@ -131,7 +131,8 @@ def test_two_agents_sharing_a_trace_each_record_their_own_session():
         "claude-opus-5", api_key="k", system_prompt="second", trace=first.get_trace()
     )
     recorded = spans(second, EventType.SESSION)
-    assert [s.payload["system_prompt"] for s in recorded] == ["first", "second"]
+    # Spans carry the trace's agent_id; the payload says which agent it was.
+    assert [s.payload["agent_id"] for s in recorded] == [first.agent_id, second.agent_id]
 
 
 # ---------------- the run span ----------------
@@ -411,3 +412,81 @@ async def test_an_early_closed_stream_ends_its_run_span_as_cancelled():
     [run_span] = spans(agent, EventType.RUN)
     assert run_span.status is SpanStatus.CANCELLED
     assert run_span.duration_ms is not None
+
+
+# ---------------- what the session span must NOT contain ----------------
+
+def test_the_session_span_fingerprints_the_prompt_instead_of_copying_it():
+    """LLM spans record metadata, never content; the session span follows suit."""
+    secret_prompt = "You are ACME's internal pricing engine. Margin floor is 37%."
+    payload = session_payload(make_agent(system_prompt=secret_prompt))
+    assert "system_prompt" not in payload
+    assert "Margin floor" not in json.dumps(payload)
+    assert len(payload["system_prompt_sha256"]) == 16
+    assert payload["system_prompt_chars"] > 0
+
+
+def test_the_prompt_fingerprint_answers_whether_two_runs_used_the_same_prompt():
+    same_a = session_payload(make_agent(system_prompt="Be concise."))
+    same_b = session_payload(make_agent(system_prompt="Be concise."))
+    other = session_payload(make_agent(system_prompt="Be verbose."))
+    assert same_a["system_prompt_sha256"] == same_b["system_prompt_sha256"]
+    assert same_a["system_prompt_sha256"] != other["system_prompt_sha256"]
+
+
+def test_the_fingerprint_covers_the_prompt_actually_sent():
+    """The environment block changes behaviour, so it changes the fingerprint."""
+    plain = AgentConfig(model="claude-opus-5", api_key="k", system_prompt="Hi.")
+    with_env = plain.replace(environment={"region": "eu"})
+    assert (
+        session_payload(make_agent(config=plain))["system_prompt_sha256"]
+        != session_payload(make_agent(config=with_env))["system_prompt_sha256"]
+    )
+
+
+def test_the_config_itself_still_round_trips_the_prompt():
+    """Only the trace fingerprints it; to_dict() is for files and must round-trip."""
+    config = AgentConfig(model="claude-opus-5", api_key="k", system_prompt="Hi.")
+    assert config.to_dict()["system_prompt"] == "Hi."
+
+
+@pytest.mark.parametrize(
+    "base_url,recorded",
+    [
+        ("https://user:s3cret@gateway.example.com/v1", "https://gateway.example.com/v1"),
+        ("https://gateway.example.com/v1?api-key=s3cret", "https://gateway.example.com/v1"),
+        ("http://localhost:8000/v1", "http://localhost:8000/v1"),
+        ("http://[::1]:8000/v1", "http://[::1]:8000/v1"),
+    ],
+)
+def test_the_session_span_strips_credentials_from_base_url(base_url, recorded):
+    payload = session_payload(
+        make_agent(
+            config=AgentConfig(
+                model="openai:llama-3.3-70b", base_url=base_url, context_window=32_768
+            )
+        )
+    )
+    assert payload["base_url"] == recorded
+    assert "s3cret" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "base_url", ["user:s3cret@gateway.example.com/v1", "gateway.example.com/v1?key=s3cret"]
+)
+def test_a_url_that_cannot_be_sanitized_is_not_echoed(base_url):
+    """Without a scheme a credential can hide in what parses as the path."""
+    payload = session_payload(
+        make_agent(
+            config=AgentConfig(
+                model="openai:llama-3.3-70b", base_url=base_url, context_window=32_768
+            )
+        )
+    )
+    assert "s3cret" not in json.dumps(payload)
+    assert payload["base_url"] == "[unparseable url]"
+
+
+def test_the_session_span_records_which_agent_it_describes():
+    agent = make_agent(agent_id="billing-agent")
+    assert session_payload(agent)["agent_id"] == "billing-agent"
