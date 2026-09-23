@@ -482,10 +482,19 @@ class AgentLoop:
                             if chunk.type is StreamChunkType.ERROR:
                                 # Streaming reports failure as an ERROR chunk,
                                 # not an AgentResult, so mark the span here.
+                                # Provider chunks are forwarded verbatim, so
+                                # do not trust the payload's shape: tracing
+                                # must never break the stream it observes.
+                                payload = chunk.payload
+                                reason = (
+                                    payload.get("reason", "")
+                                    if isinstance(payload, dict)
+                                    else payload
+                                )
                                 run_span.set_error(
                                     ErrorInfo(
                                         exception_type="StreamError",
-                                        message=str(chunk.payload.get("reason", "")),
+                                        message=str(reason),
                                         traceback="",
                                     )
                                 )

@@ -490,3 +490,24 @@ def test_a_url_that_cannot_be_sanitized_is_not_echoed(base_url):
 def test_the_session_span_records_which_agent_it_describes():
     agent = make_agent(agent_id="billing-agent")
     assert session_payload(agent)["agent_id"] == "billing-agent"
+
+
+async def test_a_malformed_error_chunk_from_a_provider_cannot_break_the_stream():
+    """Provider chunks are forwarded verbatim; tracing must tolerate any payload."""
+    from agent_framework.providers.base import StreamChunk, StreamChunkType
+
+    class OddProvider(MockLLMProvider):
+        async def stream(self, **kwargs):
+            yield StreamChunk(StreamChunkType.ERROR, payload="upstream said no")  # type: ignore[arg-type]
+            async for chunk in super().stream(**kwargs):
+                yield chunk
+
+    agent = make_agent()
+    odd = OddProvider([ScriptedTurn(text="done")])
+    agent._provider = odd
+    agent._loop.provider = odd
+    chunks = await _drain(agent, "go")
+    assert chunks
+    [run_span] = spans(agent, EventType.RUN)
+    assert run_span.status is SpanStatus.ERROR
+    assert "upstream said no" in run_span.error.message
