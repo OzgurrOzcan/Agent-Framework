@@ -40,7 +40,7 @@ callers migrate rather than carry two config shapes.
 |---|---|
 | `BaseAgent` | `Agent` |
 | `BaseAgent.create(config, ...)` | `Agent(model_or_config, ...)` |
-| `BaseAgent.acreate(config, mcp=...)` | `await Agent.connect(model_or_config, mcp=...)`, or `Agent(..., mcp=...)` for lazy discovery |
+| `BaseAgent.acreate(config, mcp=...)` | `await Agent.connect(model_or_config, mcp=...)` — note it is strict, raising `MCPDiscoveryError` where `acreate` silently skipped a broken server — or `Agent(..., mcp=...)` for tolerant, lazy discovery |
 | `AnthropicAgent`, `OpenAIAgent` | `Agent` (they were empty subclasses with no references) |
 | `ProviderKind` | the model id (`"claude-opus-5"`), or an explicit prefix (`"openai:llama-3.3-70b"`) |
 | `ProviderConfig` | flat `AgentConfig.api_key` / `.base_url`, plus `TransportConfig` for timeouts, retries and SDK client kwargs |
@@ -60,17 +60,26 @@ Other behaviour changes:
 - **`AgentConfig` is frozen and validated at construction.** `max_turns=0`,
   `temperature=3`, a negative budget, or buffers larger than the context window
   used to construct fine and misbehave several turns later. Derive variants with
-  `config.replace(...)`.
-- **`Agent(..., mcp=...)` no longer raises inside a running event loop.** It
-  defers discovery to the first run. Use `await Agent.connect(...)` to discover
-  at start-up so a misconfigured server fails at boot instead of silently
-  serving a reduced toolset.
+  `config.replace(...)`; normalization is idempotent, so every model id —
+  including `"openai:<local-model>"` — survives `replace`, `to_dict`/`from_dict`
+  and `Agent(config, override=...)`.
+- **MCP discovery happens where you choose.** `Agent(..., mcp=...)` no longer
+  raises inside a running event loop: it defers discovery to the first run, where
+  a failing server is recorded in the trace and skipped. `await
+  Agent.connect(...)` discovers at start-up and strictly, raising
+  `MCPDiscoveryError` if any server cannot be reached, so a misconfigured
+  deployment crashes at boot instead of serving a silently reduced toolset.
 - **A registry passed as `tools=` is no longer mutated.** It is copied, so
   registering `ask_user` (and MCP tools) cannot leak between agents sharing one
   registry.
 - **`MCPServerRegistry.discover_all_sync()`** is kept as a standalone utility
   for sync callers (`tools=registry.discover_all_sync()`); its error message now
   points at `Agent.connect`.
+- **Self-hosted endpoints need no credential.** A custom `base_url` makes the
+  API key optional, since a local runtime accepts any token; an explicit
+  `api_key` and the provider's environment variable still win, so an
+  authenticating gateway is unaffected. Previously every local agent had to
+  invent `api_key="not-needed"`.
 
 ### Added
 
@@ -81,38 +90,48 @@ Other behaviour changes:
   third parties, so adding a provider is one record plus one adapter class
   instead of edits in four places.
 - **Model-id resolution.** A bare name is matched by longest owned prefix
-  (`"claude-opus-5"` → anthropic); `"provider:model"` always wins and is how
-  OpenAI-compatible endpoints are addressed (`"openai:llama-3.3-70b"`). Anything
-  that cannot resolve to exactly one provider raises `ProviderResolutionError`
-  with the fix in the message — never a silent default, and never inferred from
-  which API keys happen to be set. Prefixes are broad, so a newly released model
-  works without a framework release.
-- **Six flat overrides on `Agent(...)`** — `system_prompt`, `max_turns`,
-  `max_budget_usd`, `temperature`, `api_key`, `base_url` — which override a
-  passed `AgentConfig` without mutating it, making a sub-agent a one-liner. A
-  test asserts they cannot drift from the dataclass fields.
+  (`"claude-opus-5"` → anthropic); an explicit provider — the
+  `"provider:model"` prefix or `AgentConfig(provider=...)` — always wins, and is
+  how OpenAI-compatible endpoints are addressed (`"openai:llama-3.3-70b"`,
+  `"openai:llama3.2:3b"` for an Ollama tag). Anything that cannot resolve to
+  exactly one provider raises `ProviderResolutionError` with the fix in the
+  message — never a silent default, and never inferred from which API keys
+  happen to be set. Prefixes are broad, so a newly released model works without
+  a framework release.
+- **Seven flat overrides on `Agent(...)`** — `system_prompt`, `max_turns`,
+  `max_budget_usd`, `temperature`, `api_key`, `base_url`, `context_window` —
+  which override a passed `AgentConfig` without mutating it, making a sub-agent a
+  one-liner. `context_window` pairs with `base_url`: for a self-hosted model it
+  is required rather than exotic. A test asserts the list cannot drift from the
+  dataclass fields.
 - **`AgentConfig.to_dict()` / `from_dict()` / `from_env()`** for config files,
   12-factor deploys, and trace provenance. The API key is never serialized;
   `from_dict` rejects unknown keys so a typo fails at load time.
+- **`MCPServerRegistry.discover_all(strict=True)`** and **`MCPDiscoveryError`**,
+  which names every server that failed; the default stays tolerant.
 - **`EventType.SESSION` spans** (the enum member existed but was never emitted):
-  one per agent, carrying the resolved config, tool names, MCP discovery mode,
-  whether pricing resolved, and the framework version.
+  one per agent, carrying the resolved config, the agent id, tool names, MCP
+  servers and discovery mode, whether pricing resolved, and the framework
+  version. It records settings, not content: the system prompt is fingerprinted
+  rather than copied, and `base_url` is stripped of credential-bearing parts.
 - **`EventType.RUN` spans**: one per `run()` / `run_stream()` / `complete()`,
   carrying the effective `LoopPolicy` (`max_turns`, `max_tool_rounds`,
-  `execute_tools`, `tool_choice`), the outcome and the whole-run duration, with
-  the turns nested underneath. Per-call overrides are recoverable from nowhere
-  else, and `where_it_failed()` now names which run broke.
-
-- **Self-hosted endpoints need no credential.** A custom `base_url` makes the
-  API key optional, since a local runtime accepts any token; an explicit
-  `api_key` and the provider's environment variable still win, so an
-  authenticating gateway is unaffected. Previously every local agent had to
-  invent `api_key="not-needed"`.
-- **`context_window` is a flat `Agent(...)` override**, pairing with `base_url`:
-  for a self-hosted model it is required rather than exotic.
+  `execute_tools`, `tool_choice`), the run's own turns, tool rounds and cost, and
+  its duration, with the turns nested underneath. Per-call overrides are
+  recoverable from nowhere else.
 
 ### Fixed
 
+- **Closing a stream early no longer bricks the agent.** `run_stream()` never
+  closed the loop's own generator, so after a consumer stopped early — a "stop
+  generating" button — the run-in-progress flag stayed set and every later
+  `run()` raised. An early close now ends the run cleanly.
+- **Cancellation is recorded as `cancelled`, not `error`.** A span interrupted
+  by task cancellation or an early stream close used to be marked as failed.
+- **`where_it_failed()` names the cause, not a wrapper.** It chose the failure
+  with the earliest timestamp, and a span that failed only because a child did
+  always starts first. It now returns the chain from the root down to the first
+  root-cause failure — e.g. `[run, loop_guard:max_turns]`.
 - A `ToolRegistry` passed to more than one agent no longer accumulates
   `ask_user` and MCP tools from each of them.
 - **An uncatalogued model no longer budgets its context silently wrong.** It

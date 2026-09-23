@@ -14,7 +14,7 @@
     <img src="https://github.com/OzgurrOzcan/Agent-Framework/actions/workflows/ci.yml/badge.svg" alt="CI">
   </a>
   <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12-blue" alt="Python 3.11 | 3.12">
-  <img src="https://img.shields.io/badge/tests-369%20passing-brightgreen" alt="369 tests passing">
+  <img src="https://img.shields.io/badge/tests-436%20passing-brightgreen" alt="436 tests passing">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
   <img src="https://img.shields.io/badge/typed-py.typed-informational" alt="Typed">
 </p>
@@ -148,7 +148,7 @@ provider declares (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`), or passed explicitly
 `Agent(..., api_key=...)`.
 
 ```bash
-pytest agent_framework/tests/ -q      # 369 tests, fully offline against mocked providers
+pytest agent_framework/tests/ -q      # 436 tests, fully offline against mocked providers
 ```
 
 No key is required to run the test suite.
@@ -299,11 +299,13 @@ Tools arrive namespaced (`fs__read_text_file`), so two servers exposing the same
 name never collide.
 
 Decide where discovery happens. `await Agent.connect(...)` connects and discovers now,
-so a misconfigured server fails at start-up — what you want from a service, since
-discovery reports connection errors as trace events rather than raising, and a container
-that boots green would otherwise serve a silently reduced toolset. `Agent(..., mcp=...)`
-defers discovery to the first run instead: convenient in a script or notebook, at the
-cost of `agent.tools` being incomplete until then. Always pass a `trace`, either way.
+and strictly: if any server cannot be reached or listed it raises `MCPDiscoveryError`
+naming every one that failed, so a misconfigured deployment crashes at start-up instead of
+booting green and serving a silently reduced toolset. `Agent(..., mcp=...)` defers
+discovery to the first run instead — convenient in a script or notebook — and there a
+failing server is recorded in the trace and skipped, because errors inside a run are
+feedback, never exceptions; `agent.tools` is incomplete until that first run. Always pass
+a `trace` to the registry, either way: it is where skipped servers are reported.
 
 ### Local and self-hosted models
 
@@ -361,10 +363,13 @@ account for GPU time. The session span records `pricing_resolved: false` so a tr
 lies about which guard was armed.
 
 Two compatibility notes. Requests carry `max_completion_tokens`, the current Chat
-Completions field; a server old enough to accept only `max_tokens` will reject it. And
-`to_json()` uses the provider's native structured-output mode, which local servers
-implement to varying degrees — vLLM's guided decoding handles it, smaller runtimes may
-not. Both are reachable per-request through `request_extra` without touching the adapter.
+Completions field. A server that only understands the older `max_tokens` either rejects
+the request or ignores the field, and then applies no response cap at all;
+`request_extra={"max_tokens": 1024}` adds the older field alongside, which covers servers
+that ignore unknown fields but not ones that reject them. And `to_json()` uses the
+provider's native structured-output mode, which self-hosted runtimes support to varying
+degrees — `request_extra` does not apply to it, so on a runtime without that support use
+`complete()` and parse the text yourself.
 
 ### Observability
 
@@ -399,6 +404,15 @@ model was priced at all (an unpriced model records `$0.00` and silently disables
 config per call: without it, a trace cannot separate "the caller capped this run" from
 "the deployed config changed", nor tell a `max_tool_rounds` cap or `complete()` apart
 from a permission wall — all three look like `tool_use` with no `tool_call` span.
+
+Like every other span, `session` records settings, not content: the system prompt is
+fingerprinted rather than copied (enough to tell whether two runs used the same prompt),
+and `base_url` is stripped of userinfo and query strings, where credentials hide.
+
+`where_it_failed()` returns the chain from the root down to the *cause* — for a run
+stopped by its turn limit, `[run, loop_guard:max_turns]` — skipping spans that failed only
+because a child did. Cancelling a run, or closing its stream early, marks its spans
+`cancelled` rather than `error`, and the agent stays usable.
 
 For a live UI, subscribe once — that single hook is all a renderer needs:
 
@@ -536,7 +550,7 @@ nothing else in the framework to touch.
 
 ## Project status
 
-`0.1.0` — the core is stable and covered by **369 tests** that run fully offline, including
+`0.1.0` — the core is stable and covered by **436 tests** that run fully offline, including
 golden-request tests that pin both providers' wire formats. CI runs lint and the full
 suite on Python 3.11 and 3.12.
 

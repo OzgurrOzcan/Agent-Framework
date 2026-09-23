@@ -174,7 +174,10 @@ def local_server():
     """An OpenAI-compatible server on an ephemeral localhost port."""
     _Handler.received = []
     server = HTTPServer(("127.0.0.1", 0), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # A short poll interval keeps shutdown() from adding ~0.5s per test.
+    threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    ).start()
     try:
         yield f"http://127.0.0.1:{server.server_port}/v1", _Handler
     finally:
