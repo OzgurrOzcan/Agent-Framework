@@ -19,6 +19,7 @@ are wiring, not configuration, and are passed to `Agent(...)` directly.
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Any
 
@@ -32,10 +33,16 @@ from agent_framework.providers.catalog import (
 # Re-exported for callers who budget context themselves.
 __all__ = [
     "DEFAULT_CONTEXT_WINDOW",
+    "LOCAL_API_KEY_PLACEHOLDER",
     "AgentConfig",
     "CompactionConfig",
     "TransportConfig",
 ]
+
+# Sent as the bearer token when a custom `base_url` is set and no key is
+# configured. Local runtimes (vLLM, llama.cpp, Ollama) require the header to
+# exist but ignore its value.
+LOCAL_API_KEY_PLACEHOLDER = "not-needed"
 
 
 def _require(condition: bool, message: str) -> None:
@@ -205,6 +212,18 @@ class AgentConfig:
             self.max_parallel_tools >= 1,
             f"max_parallel_tools must be >= 1, got {self.max_parallel_tools}",
         )
+        # An unrecognized model silently inherits the provider's fallback
+        # window. Budgeting a locally served 8k model as 200k means compaction
+        # never fires and the endpoint rejects the overflow instead.
+        if self.context_window is None and spec.known_context_window(bare_model) is None:
+            warnings.warn(
+                f"Unknown context window for model {bare_model!r}; assuming "
+                f"{spec.default_context_window} tokens. If the real window is "
+                "smaller, compaction will not fire in time and the provider "
+                "will reject the request — pass context_window=... to set it.",
+                stacklevel=3,
+            )
+
         # Buffers larger than the window leave a 1-token conversation budget
         # (ContextManager.budget clamps), which compacts every single turn.
         window = self.resolved_context_window
@@ -230,18 +249,29 @@ class AgentConfig:
         return self.provider_spec.context_window(self.model)
 
     def resolved_api_key(self) -> str:
-        """The API key, from `api_key` or the provider's environment variable."""
+        """The API key, from `api_key` or the provider's environment variable.
+
+        A custom `base_url` makes the key optional: that endpoint is not the
+        vendor's own API, and a local runtime usually accepts any token — so
+        demanding one would mean inventing a fake value for every local model.
+        An explicit key and the environment variable still win, so a gateway
+        that does authenticate keeps working; one that wants a key and gets the
+        placeholder answers 401, which is a clear error rather than a silent one.
+        """
         if self.api_key:
             return self.api_key
         env_key = self.provider_spec.env_key
         key = os.environ.get(env_key)
-        if not key:
-            raise RuntimeError(
-                f"No API key for provider {self.provider!r}: pass "
-                f"AgentConfig(api_key=...) / Agent(..., api_key=...), or set "
-                f"the {env_key} environment variable."
-            )
-        return key
+        if key:
+            return key
+        if self.base_url:
+            return LOCAL_API_KEY_PLACEHOLDER
+        raise RuntimeError(
+            f"No API key for provider {self.provider!r}: pass "
+            f"AgentConfig(api_key=...) / Agent(..., api_key=...), or set "
+            f"the {env_key} environment variable. (A self-hosted endpoint "
+            "needs no key — set base_url= and the key becomes optional.)"
+        )
 
     def replace(self, **overrides: Any) -> AgentConfig:
         """A copy with *overrides* applied (`dataclasses.replace`)."""

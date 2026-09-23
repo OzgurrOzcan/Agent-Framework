@@ -78,6 +78,9 @@ _CONFIG_OVERRIDES = (
     "temperature",
     "api_key",
     "base_url",
+    # Pairs with base_url: a self-hosted endpoint's window is not in the
+    # catalog, and getting it wrong means compaction never fires.
+    "context_window",
 )
 
 
@@ -95,6 +98,7 @@ class Agent:
         temperature: float | None = _UNSET,
         api_key: str | None = _UNSET,
         base_url: str | None = _UNSET,
+        context_window: int | None = _UNSET,
         # --- wiring ---
         tools: ToolRegistry | Iterable[Tool] | None = None,
         permissions: PermissionConfig | None = None,
@@ -112,8 +116,9 @@ class Agent:
             config: a model id (``"claude-opus-5"``, ``"openai:llama-3.3-70b"``)
                 or an `AgentConfig`.
             system_prompt, max_turns, max_budget_usd, temperature, api_key,
-                base_url: override the corresponding `AgentConfig` field.
-                Anything not listed here is set on an `AgentConfig` instead.
+                base_url, context_window: override the corresponding
+                `AgentConfig` field. Anything not listed here is set on an
+                `AgentConfig` instead.
             tools: `Tool` objects (from `@tool`) or a `ToolRegistry`. Copied,
                 so a registry shared between agents is never mutated.
             permissions: rules and the renderer that answers `ASK` prompts.
@@ -137,6 +142,7 @@ class Agent:
             temperature=temperature,
             api_key=api_key,
             base_url=base_url,
+            context_window=context_window,
         )
 
         # Copy the tools: registering `ask_user` (and later the MCP tools)

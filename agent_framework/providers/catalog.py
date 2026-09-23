@@ -82,14 +82,25 @@ class ProviderSpec:
             default=0,
         )
 
-    def context_window(self, model: str) -> int:
-        """Best-effort context window for *model* (longest prefix wins)."""
+    def known_context_window(self, model: str) -> int | None:
+        """The declared context window for *model*, or None if undeclared.
+
+        The distinction matters: a model this provider does not recognize gets
+        a fallback that can be wildly wrong (a locally served 8k model budgeted
+        as if it had 200k never compacts, and overflows at the endpoint), so
+        callers that can warn about it need to tell the two cases apart.
+        """
         best_len = -1
-        window = self.default_context_window
+        window: int | None = None
         for prefix, size in self.context_windows:
             if model.startswith(prefix) and len(prefix) > best_len:
                 best_len, window = len(prefix), size
         return window
+
+    def context_window(self, model: str) -> int:
+        """Best-effort context window for *model* (longest prefix wins)."""
+        known = self.known_context_window(model)
+        return known if known is not None else self.default_context_window
 
 
 # --------------------------------------------------------------------------
