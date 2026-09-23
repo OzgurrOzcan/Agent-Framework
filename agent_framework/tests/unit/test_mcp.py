@@ -71,6 +71,66 @@ def test_discover_all_sync_works_without_running_loop():
     assert tools[0].metadata.source == "mcp:alpha"
 
 
+def _broken_client(name: str):
+    """Connects, then fails to list tools — no retry backoff, so tests stay fast."""
+    client = _make_mock_server_client(name)
+
+    async def _unreachable(*_args, **_kwargs):
+        raise ConnectionError(f"{name} is not reachable")
+
+    client.list_tools = _unreachable
+    return client
+
+
+async def test_discover_all_tolerates_a_failing_server_by_default():
+    from agent_framework.tracing.trace import EventType, ExecutionTrace
+
+    registry = _registry_with(_make_mock_server_client("alpha"), _broken_client("beta"))
+    registry._trace = ExecutionTrace()
+    tools = await registry.discover_all()
+    assert [t.name for t in tools] == ["alpha__search"]
+    errors = [e for e in registry._trace.all_spans() if e.event_type is EventType.ERROR]
+    assert [e.name for e in errors] == ["mcp:beta"]
+
+
+async def test_strict_discovery_raises_naming_every_failed_server():
+    from agent_framework.mcp.registry import MCPDiscoveryError
+
+    registry = _registry_with(
+        _make_mock_server_client("alpha"), _broken_client("beta"), _broken_client("gamma")
+    )
+    with pytest.raises(MCPDiscoveryError) as exc:
+        await registry.discover_all(strict=True)
+    assert set(exc.value.failures) == {"beta", "gamma"}
+    assert "beta" in str(exc.value) and "gamma" in str(exc.value)
+    assert isinstance(exc.value.__cause__, ConnectionError)
+
+
+async def test_strict_discovery_still_records_trace_events():
+    from agent_framework.mcp.registry import MCPDiscoveryError
+    from agent_framework.tracing.trace import EventType, ExecutionTrace
+
+    registry = _registry_with(_broken_client("beta"))
+    registry._trace = ExecutionTrace()
+    with pytest.raises(MCPDiscoveryError):
+        await registry.discover_all(strict=True)
+    assert any(e.event_type is EventType.ERROR for e in registry._trace.all_spans())
+
+
+async def test_strict_discovery_returns_normally_when_all_servers_work():
+    registry = _registry_with(_make_mock_server_client("alpha"))
+    assert [t.name for t in await registry.discover_all(strict=True)] == ["alpha__search"]
+
+
+def test_discover_all_sync_passes_strict_through():
+    from agent_framework.mcp.registry import MCPDiscoveryError
+
+    registry = _registry_with(_broken_client("beta"))
+    assert registry.discover_all_sync() == []
+    with pytest.raises(MCPDiscoveryError):
+        registry.discover_all_sync(strict=True)
+
+
 # ---------------------------------------------------------------------------
 # T2.6 — tool name namespacing
 # ---------------------------------------------------------------------------

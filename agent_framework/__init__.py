@@ -49,7 +49,11 @@ from agent_framework.memory.manager import MemoryManager
 from agent_framework.memory.short_term import ShortTermMemory
 from agent_framework.memory.long_term import LongTermMemory
 from agent_framework.memory.backends.sqlite import SQLiteBackend
-from agent_framework.mcp.registry import MCPServerRegistry, MCPConnectionConfig
+from agent_framework.mcp.registry import (
+    MCPConnectionConfig,
+    MCPDiscoveryError,
+    MCPServerRegistry,
+)
 from agent_framework.tracing.trace import ExecutionTrace, TraceEvent, ErrorInfo
 from agent_framework.tracing.reporter import TraceReporter
 from agent_framework.tracing.cost import CostTracker, PricingTable
@@ -92,6 +96,7 @@ __all__ = [
     "SQLiteBackend",
     "MCPServerRegistry",
     "MCPConnectionConfig",
+    "MCPDiscoveryError",
     "ExecutionTrace",
     "TraceEvent",
     "ErrorInfo",

@@ -69,8 +69,10 @@ class _Unset:
 _UNSET: Any = _Unset()
 
 # Config fields that `Agent(...)` accepts directly. Every name here must be an
-# `AgentConfig` field — `test_agent_config_overrides_match_config_fields`
-# enforces that, so the two can never drift.
+# `AgentConfig` field and a keyword argument below —
+# `test_every_override_is_a_real_config_field` and
+# `test_every_override_is_an_actual_keyword_argument` enforce both, so the
+# flat surface can never drift from the dataclass.
 _CONFIG_OVERRIDES = (
     "system_prompt",
     "max_turns",
@@ -109,6 +111,9 @@ class Agent:
         agent_id: str | None = None,
         parent_permissions: PermissionConfig | None = None,
         provider: BaseProviderAdapter | None = None,
+        # Internal: set by `connect()`, which has already merged the MCP tools
+        # into `tools`, so the session span records the true discovery mode.
+        _mcp_discovered: bool = False,
     ) -> None:
         """Build an agent.
 
@@ -123,8 +128,9 @@ class Agent:
                 so a registry shared between agents is never mutated.
             permissions: rules and the renderer that answers `ASK` prompts.
             mcp: MCP servers whose tools this agent may call. Discovery is
-                deferred to the first run — use `await Agent.connect(...)` to
-                discover eagerly and fail at construction instead.
+                deferred to the first run, and a failing server is recorded in
+                the trace and skipped. Use `await Agent.connect(...)` to
+                discover eagerly and raise on any failure instead.
             memory, trace, pricing: injected subsystems; sensible defaults are
                 built when omitted.
             agent_id: stable id for traces; generated when omitted.
@@ -175,9 +181,9 @@ class Agent:
         self._provider = provider if provider is not None else _build_provider(self.config)
 
         self._mcp = mcp
-        self._mcp_discovered = mcp is None
+        self._mcp_discovered = mcp is None or _mcp_discovered
         self._mcp_lock = asyncio.Lock()
-        if mcp is not None and self.config.include_capabilities_block:
+        if not self._mcp_discovered and self.config.include_capabilities_block:
             warnings.warn(
                 "include_capabilities_block=True with lazily discovered MCP "
                 "tools: the <capabilities> block is built once at construction "
@@ -243,18 +249,18 @@ class Agent:
     ) -> Agent:
         """Build an agent and discover its MCP tools now, not on first run.
 
-        Prefer this at service start-up: a server that cannot be reached fails
-        here, while the plain constructor defers discovery and would serve a
-        silently reduced toolset instead. Takes the same arguments as
-        `Agent(...)`.
+        Prefer this at service start-up. Discovery is strict here: if any
+        server cannot be reached or listed, `MCPDiscoveryError` names every
+        one that failed, so a misconfigured deployment crashes at boot rather
+        than serving a silently reduced toolset. (The plain constructor defers
+        discovery to the first run, where a failing server is recorded in the
+        trace and skipped instead — errors inside a run are never raised.)
+        Takes the same arguments as `Agent(...)`.
         """
         tools = ToolRegistry(to_registry(kwargs.pop("tools", None)))
-        for discovered in await mcp.discover_all():
-            tools.replace(discovered)
-        agent = cls(config, tools=tools, **kwargs)
-        agent._mcp = mcp
-        agent._mcp_discovered = True
-        return agent
+        for discovered in await mcp.discover_all(strict=True):
+            tools.add(discovered)
+        return cls(config, tools=tools, mcp=mcp, _mcp_discovered=True, **kwargs)
 
     async def _ensure_mcp(self) -> None:
         """Discover MCP tools once, before the first provider call."""
@@ -263,8 +269,10 @@ class Agent:
         async with self._mcp_lock:
             if self._mcp_discovered or self._mcp is None:
                 return
+            # add(), not replace(): an MCP tool shadowing a native one of the
+            # same name deserves the registry's overwrite warning.
             for discovered in await self._mcp.discover_all():
-                self._tools.replace(discovered)
+                self._tools.add(discovered)
             self._mcp_discovered = True
 
     # ===================== execution =====================

@@ -20,13 +20,16 @@ import pytest
 from agent_framework.core.agent import _CONFIG_OVERRIDES, Agent
 from agent_framework.core.config import AgentConfig
 from agent_framework.mcp.provider import MCPToolProvider
-from agent_framework.mcp.registry import MCPServerRegistry
+from agent_framework.mcp.registry import MCPDiscoveryError, MCPServerRegistry
 from agent_framework.permissions.config import AllowRule, DenyRule, PermissionConfig
 from agent_framework.permissions.models import PermissionCategory
 from agent_framework.providers.catalog import ProviderResolutionError
+from agent_framework.tests.mocks.mock_llm import MockLLMProvider, ScriptedTurn
 from agent_framework.tests.mocks.mock_mcp import MockMCPServer
 from agent_framework.tools.decorator import tool
+from agent_framework.tools.models import Tool, ToolMetadata
 from agent_framework.tools.registry import ToolRegistry
+from agent_framework.tracing.trace import EventType, ExecutionTrace
 
 
 @tool(description="Add two numbers", permission=PermissionCategory.AUTO)
@@ -34,15 +37,32 @@ async def add(a: int, b: int) -> int:
     return a + b
 
 
-def _mcp_registry(name: str = "srv", tool_name: str = "search") -> MCPServerRegistry:
-    """A registry backed by a mock client — no real MCP SDK, no subprocess."""
+def _mcp_registry(
+    name: str = "srv", tool_name: str = "search", *, broken: bool = False, registry=None
+) -> MCPServerRegistry:
+    """A registry backed by a mock client — no real MCP SDK, no subprocess.
+
+    `broken=True` makes the server connect but fail to list its tools, the
+    shape of a misconfigured server (and not subject to connection retries,
+    so the test stays fast). Pass `registry` to add a server to an existing one.
+    """
     server = MockMCPServer(name)
     server.register(tool_name, lambda query: f"{name}:{query}")
     client = server.as_client()
-    registry = MCPServerRegistry()
+    if broken:
+        async def _unreachable(*_args, **_kwargs):
+            raise ConnectionError(f"{name} is not reachable")
+
+        client.list_tools = _unreachable  # type: ignore[method-assign]
+    registry = registry if registry is not None else MCPServerRegistry(trace=ExecutionTrace())
     registry._clients[client.name] = client  # type: ignore[assignment]
     registry._providers[client.name] = MCPToolProvider(client)  # type: ignore[arg-type]
     return registry
+
+
+def _session(agent: Agent) -> dict:
+    [span] = [s for s in agent.get_trace().all_spans() if s.event_type is EventType.SESSION]
+    return span.payload
 
 
 # ---------------- the flat surface ----------------
@@ -295,3 +315,102 @@ def test_no_warning_without_a_capabilities_block():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         Agent("claude-opus-5", api_key="k", mcp=_mcp_registry())
+
+
+# ---------------- MCP failure handling ----------------
+
+async def test_connect_fails_on_an_unreachable_server():
+    """The reason to prefer connect() at boot: no silently reduced toolset."""
+    with pytest.raises(MCPDiscoveryError) as exc:
+        await Agent.connect("claude-opus-5", api_key="k", mcp=_mcp_registry(broken=True))
+    assert "srv" in str(exc.value)
+    assert set(exc.value.failures) == {"srv"}
+
+
+async def test_connect_names_every_server_that_failed():
+    registry = _mcp_registry("good")
+    _mcp_registry("bad1", broken=True, registry=registry)
+    _mcp_registry("bad2", broken=True, registry=registry)
+    with pytest.raises(MCPDiscoveryError) as exc:
+        await Agent.connect("claude-opus-5", api_key="k", mcp=registry)
+    assert set(exc.value.failures) == {"bad1", "bad2"}
+
+
+async def test_lazy_discovery_tolerates_an_unreachable_server():
+    """Inside run() errors are feedback: the run proceeds, the trace records it."""
+    registry = _mcp_registry(broken=True)
+    agent = Agent("claude-opus-5", api_key="k", mcp=registry)
+    mock = MockLLMProvider([ScriptedTurn(text="done")])
+    agent._provider = mock
+    agent._loop.provider = mock
+    result = await agent.run("go")
+    assert result.error is None
+    assert "srv__search" not in agent.tools
+    assert any(e.event_type is EventType.ERROR for e in registry._trace.all_spans())
+
+
+# ---------------- MCP provenance ----------------
+
+async def test_connect_records_eager_discovery_in_the_session_span():
+    agent = await Agent.connect("claude-opus-5", api_key="k", mcp=_mcp_registry())
+    payload = _session(agent)
+    assert payload["mcp_discovery"] == "eager"
+    assert payload["mcp_servers"] == ["srv"]
+    assert "srv__search" in payload["tools"]
+
+
+def test_the_constructor_records_lazy_discovery_in_the_session_span():
+    agent = Agent("claude-opus-5", api_key="k", mcp=_mcp_registry())
+    payload = _session(agent)
+    assert payload["mcp_discovery"] == "lazy"
+    assert payload["mcp_servers"] == ["srv"]
+
+
+async def test_connect_does_not_rediscover_on_the_first_run():
+    registry = _mcp_registry()
+    agent = await Agent.connect("claude-opus-5", api_key="k", mcp=registry)
+    calls = {"n": 0}
+    original = registry.discover_all
+
+    async def counting(*args, **kwargs):
+        calls["n"] += 1
+        return await original(*args, **kwargs)
+
+    registry.discover_all = counting  # type: ignore[method-assign]
+    await agent._ensure_mcp()
+    assert calls["n"] == 0
+
+
+async def test_connect_with_a_capabilities_block_does_not_warn():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        await Agent.connect(_capabilities_config(), mcp=_mcp_registry())
+
+
+# ---------------- tool-name collisions ----------------
+
+def _native(name: str) -> Tool:
+    return Tool(
+        metadata=ToolMetadata(
+            name=name,
+            description="native",
+            parameters_schema={"type": "object", "properties": {}},
+        ),
+        fn=lambda: "native",
+    )
+
+
+async def test_an_mcp_tool_shadowing_a_native_one_warns_on_connect():
+    """Silently replacing a user's tool would be worse than a noisy warning."""
+    with pytest.warns(UserWarning, match="srv__search"):
+        await Agent.connect(
+            "claude-opus-5", api_key="k", mcp=_mcp_registry(), tools=[_native("srv__search")]
+        )
+
+
+async def test_an_mcp_tool_shadowing_a_native_one_warns_lazily():
+    agent = Agent(
+        "claude-opus-5", api_key="k", mcp=_mcp_registry(), tools=[_native("srv__search")]
+    )
+    with pytest.warns(UserWarning, match="srv__search"):
+        await agent._ensure_mcp()
