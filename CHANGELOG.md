@@ -103,10 +103,22 @@ Other behaviour changes:
   the turns nested underneath. Per-call overrides are recoverable from nowhere
   else, and `where_it_failed()` now names which run broke.
 
+- **Self-hosted endpoints need no credential.** A custom `base_url` makes the
+  API key optional, since a local runtime accepts any token; an explicit
+  `api_key` and the provider's environment variable still win, so an
+  authenticating gateway is unaffected. Previously every local agent had to
+  invent `api_key="not-needed"`.
+- **`context_window` is a flat `Agent(...)` override**, pairing with `base_url`:
+  for a self-hosted model it is required rather than exotic.
+
 ### Fixed
 
 - A `ToolRegistry` passed to more than one agent no longer accumulates
   `ask_user` and MCP tools from each of them.
+- **An uncatalogued model no longer budgets its context silently wrong.** It
+  used to inherit the provider's 200k fallback, so a locally served 8k model
+  never triggered compaction and overflowed at the endpoint. Construction now
+  warns and names `context_window=` as the fix.
 
 ## [0.1.0]
 

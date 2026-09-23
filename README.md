@@ -58,7 +58,8 @@ Nothing else changes either — not your tools, not your permissions, not your t
 
 | | |
 |---|---|
-| **One loop, any provider** | Anthropic and OpenAI adapters behind a normalized message model; any OpenAI-compatible endpoint via `base_url`. Golden tests pin both wire formats. |
+| **One loop, any provider** | Anthropic and OpenAI adapters behind a normalized message model. Golden tests pin both wire formats. |
+| **Local models, same code** | vLLM, llama.cpp, Ollama or any OpenAI-compatible endpoint via `base_url` — no API key, and every tool, permission and trace behaves identically. |
 | **Four verbs, not forty** | `run()`, `complete()`, `run_stream()`, `to_json()`. Run shape comes from parameters, not from a new class per pattern. |
 | **Can't run away** | Four independent stop layers: natural · `max_turns` · stall detection · USD budget guard. |
 | **Deny-first permissions** | Four categories per tool, overridable by glob and argument-regex rules without touching tool code. Sub-agents can never widen a parent's permissions. |
@@ -196,13 +197,20 @@ config = AgentConfig(
 
 agent      = Agent(config, tools=[add])
 summariser = Agent(config, system_prompt="Summarise.", max_turns=2)   # override, no mutation
-local      = Agent("openai:llama-3.3-70b", base_url="http://localhost:8000/v1")
-deployed   = Agent(AgentConfig.from_env())      # AGENT_MODEL, AGENT_MAX_TURNS, ...
 ```
 
-An unknown model id is rejected at construction with the fix in the message, so a
-typo can never reach a provider — and `"openai:<name>"` is how any OpenAI-compatible
-endpoint is addressed.
+An override is applied with `dataclasses.replace`, so the config you passed is never
+mutated and one config can seed a whole family of agents. An unknown model id is
+rejected at construction with the fix in the message, so a typo can never reach a
+provider.
+
+Config can also come from the environment, for the same image deployed with different
+settings per stage — `AGENT_MODEL`, `AGENT_MAX_TURNS`, `AGENT_MAX_BUDGET_USD` and the
+other flat fields, all validated on the way in:
+
+```python
+agent = Agent(AgentConfig.from_env())            # or from_env(prefix="MYAPP_")
+```
 
 `run()` never raises for operational failures. A budget stop, a turn-limit stop, or a
 provider error comes back as `result.stop_reason == StopReason.ERROR` with the exception
@@ -297,6 +305,67 @@ that boots green would otherwise serve a silently reduced toolset. `Agent(..., m
 defers discovery to the first run instead: convenient in a script or notebook, at the
 cost of `agent.tools` being incomplete until then. Always pass a `trace`, either way.
 
+### Local and self-hosted models
+
+Any server that speaks the OpenAI wire format is a first-class target: vLLM, llama.cpp's
+`llama-server`, Ollama's `/v1` endpoint, LM Studio, or a corporate gateway. Name the
+adapter explicitly and point `base_url` at it — the `openai:` prefix selects the wire
+format, not the vendor.
+
+```python
+agent = Agent(
+    "openai:llama-3.3-70b",                  # adapter := openai; "llama-3.3-70b" hits the wire
+    base_url="http://localhost:8000/v1",
+    context_window=32_768,                   # your server's real window — see below
+    system_prompt="You are a helpful assistant.",
+    tools=[add],
+)
+```
+
+No API key is needed. A custom `base_url` makes the credential optional, because a local
+runtime accepts any token and the vendor's key would be the wrong one anyway; an explicit
+`api_key=` or the provider's environment variable still wins, so an authenticating gateway
+works unchanged.
+
+Everything above the adapter is untouched by the switch: the tool loop, permissions,
+`ask_user`, MCP servers, context compaction, checkpoints and the trace all behave exactly
+as they do against a vendor API.
+
+**Three things differ, and the framework tells you about two of them.**
+
+*Set `context_window` yourself.* The catalog knows the windows of models it ships with;
+yours it cannot. Left unset, the model inherits the provider's 200k fallback — and a model
+actually served with an 8k window would then never trigger compaction and simply overflow
+at the endpoint. Constructing an uncatalogued model without a window warns, naming the fix.
+
+*Small windows need smaller buffers.* The defaults reserve 8192 tokens for the response
+and 4096 to run compaction, which does not fit an 8k window; construction fails with that
+arithmetic spelled out. Tighten them together:
+
+```python
+from agent_framework import Agent, AgentConfig
+
+agent = Agent(AgentConfig(
+    model="openai:qwen2.5-7b-instruct",
+    base_url="http://localhost:8000/v1",
+    context_window=8192,
+    response_buffer_tokens=1024,
+    compaction_buffer_tokens=512,
+))
+```
+
+*Cost tracking is inert.* An unpriced model records `$0.00`, which for local inference is
+honest, but it also means `max_budget_usd` enforces nothing — bound those runs with
+`max_turns` instead, or register your own cost-per-token in the `PricingTable` if you
+account for GPU time. The session span records `pricing_resolved: false` so a trace never
+lies about which guard was armed.
+
+Two compatibility notes. Requests carry `max_completion_tokens`, the current Chat
+Completions field; a server old enough to accept only `max_tokens` will reject it. And
+`to_json()` uses the provider's native structured-output mode, which local servers
+implement to varying degrees — vLLM's guided decoding handles it, smaller runtimes may
+not. Both are reachable per-request through `request_extra` without touching the adapter.
+
 ### Observability
 
 Tracing is not an add-on — the loop, executor, permission resolver, and context manager
@@ -388,7 +457,7 @@ agent.restore(cid)                # exact rollback
 ```python
 # construction — a model id or an AgentConfig, plus overrides
 agent = Agent("claude-opus-5", system_prompt=..., max_turns=..., max_budget_usd=...,
-              temperature=..., api_key=..., base_url=...,
+              temperature=..., api_key=..., base_url=..., context_window=...,
               tools=[...], permissions=..., memory=..., trace=..., pricing=...)
 agent = await Agent.connect(config, mcp=registry, tools=[...])   # discover MCP eagerly
 
