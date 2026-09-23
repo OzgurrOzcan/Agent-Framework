@@ -29,9 +29,10 @@ There is no `set_mode`. The framework has no modes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 import warnings
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncGenerator, Iterable
 from typing import Any
 
 from agent_framework.core.config import AgentConfig
@@ -325,18 +326,29 @@ class Agent:
         max_turns: int | None = None,
         max_tool_rounds: int | None = None,
         tool_choice: ToolChoice | None = None,
-    ) -> AsyncIterator[StreamChunk]:
-        """`run()` with a streaming transport (yields StreamChunk events)."""
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """`run()` with a streaming transport (yields StreamChunk events).
+
+        Closing this generator early (``await stream.aclose()``, or leaving an
+        ``async with contextlib.aclosing(...)`` block) stops the run cleanly:
+        its spans end as cancelled and the agent is immediately reusable.
+        """
         await self._ensure_mcp()
-        async for c in self._loop.stream(
-            user_input,
-            policy=self._run_policy(
-                max_turns=max_turns,
-                max_tool_rounds=max_tool_rounds,
-                tool_choice=tool_choice,
-            ),
-        ):
-            yield c
+        # aclosing: without it, closing this generator leaves the loop's own
+        # generator suspended, so its "run in progress" flag is never cleared
+        # and every later run() on this agent raises.
+        async with contextlib.aclosing(
+            self._loop.stream(
+                user_input,
+                policy=self._run_policy(
+                    max_turns=max_turns,
+                    max_tool_rounds=max_tool_rounds,
+                    tool_choice=tool_choice,
+                ),
+            )
+        ) as chunks:
+            async for c in chunks:
+                yield c
 
     async def complete(
         self,

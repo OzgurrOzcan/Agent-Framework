@@ -18,10 +18,11 @@ Design laws enforced here:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any, AsyncGenerator
 
 from agent_framework.core.config import AgentConfig
 from agent_framework.core.context_manager import ContextManager
@@ -458,17 +459,43 @@ class AgentLoop:
         user_input: str,
         *,
         policy: LoopPolicy,
-    ) -> AsyncIterator[StreamChunk]:
+    ) -> AsyncGenerator[StreamChunk, None]:
         self._acquire_run()
+        # Owned here rather than inside _stream_inner so the RUN span can
+        # report this run's own numbers; the trace-wide turn counter is
+        # cumulative across runs.
+        state = LoopState()
         try:
             with self.trace.start_span(
                 EventType.RUN,
                 name="run",
                 payload=_policy_payload(policy, streaming=True),
             ) as run_span:
-                async for chunk in self._stream_inner(user_input, policy=policy):
-                    yield chunk
-                run_span.update(turns=self.trace.current_turn)
+                try:
+                    # aclosing: if our consumer closes the stream early, close
+                    # the inner generator now, so its spans end and its
+                    # cleanup runs instead of waiting for garbage collection.
+                    async with contextlib.aclosing(
+                        self._stream_inner(user_input, policy=policy, state=state)
+                    ) as chunks:
+                        async for chunk in chunks:
+                            if chunk.type is StreamChunkType.ERROR:
+                                # Streaming reports failure as an ERROR chunk,
+                                # not an AgentResult, so mark the span here.
+                                run_span.set_error(
+                                    ErrorInfo(
+                                        exception_type="StreamError",
+                                        message=str(chunk.payload.get("reason", "")),
+                                        traceback="",
+                                    )
+                                )
+                            yield chunk
+                finally:
+                    run_span.update(
+                        turns=state.turn,
+                        tool_rounds=state.tool_rounds,
+                        cost_usd=state.cumulative_cost_usd,
+                    )
         finally:
             self._running = False
 
@@ -477,8 +504,8 @@ class AgentLoop:
         user_input: str,
         *,
         policy: LoopPolicy,
-    ) -> AsyncIterator[StreamChunk]:
-        state = LoopState()
+        state: LoopState,
+    ) -> AsyncGenerator[StreamChunk, None]:
         self.short_term.append(UserMessage(content=user_input))
 
         try:
