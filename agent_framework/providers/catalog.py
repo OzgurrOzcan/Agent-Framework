@@ -170,8 +170,10 @@ OPENAI = ProviderSpec(
         ("gpt-4o", 128_000),
         ("gpt-4.1", 1_000_000),
         ("gpt-5", 400_000),
+        ("chatgpt-4o", 128_000),
         ("o1", 200_000),
         ("o3", 200_000),
+        ("o4-", 200_000),
     ),
 )
 
@@ -292,9 +294,10 @@ def resolve_model(model_id: str) -> tuple[ProviderSpec, str]:
         if sep and head:
             raise ProviderResolutionError(
                 f"Model id {model_id!r} looks like \"provider:model\", but "
-                f"{head!r} is not a registered provider. Registered providers: "
-                f"{', '.join(provider_names()) or '(none)'}. "
-                "Register your own with providers.catalog.register_provider()."
+                f"{head!r} is not a registered provider. If the colon belongs "
+                "to the model name (an Ollama tag such as \"llama3.2:3b\"), "
+                f'name the adapter explicitly: "openai:{model}". Registered '
+                f"providers: {', '.join(provider_names()) or '(none)'}."
             ) from None
         raise
 

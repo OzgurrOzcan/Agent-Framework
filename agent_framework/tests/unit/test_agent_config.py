@@ -47,9 +47,83 @@ def test_provider_field_and_prefix_may_agree():
     assert (config.provider, config.model) == ("anthropic", "claude-opus-5")
 
 
-def test_provider_field_contradicting_the_model_is_rejected():
+def test_a_prefix_contradicting_the_provider_field_is_rejected():
+    """Two explicit statements that disagree: refuse rather than pick one."""
     with pytest.raises(ValueError, match="contradicts"):
-        AgentConfig(model="claude-opus-5", provider="openai")
+        AgentConfig(model="anthropic:claude-opus-5", provider="openai")
+
+
+def test_the_provider_field_names_a_provider_for_an_unprefixed_model():
+    """The documented use: a model whose name no provider's prefixes claim."""
+    config = AgentConfig(model="llama-3.3-70b", provider="openai", context_window=32_768)
+    assert (config.provider, config.model) == ("openai", "llama-3.3-70b")
+
+
+def test_the_provider_field_overrides_inference():
+    """Same as "openai:claude-opus-5": Claude through an OpenAI-compatible gateway."""
+    config = AgentConfig(model="claude-opus-5", provider="openai")
+    assert (config.provider, config.model) == ("openai", "claude-opus-5")
+
+
+def test_an_unknown_provider_field_is_rejected():
+    with pytest.raises(ProviderResolutionError, match="bedrock"):
+        AgentConfig(model="claude-opus-5", provider="bedrock")
+
+
+# Every shape a model id can take. Normalization must reach a fixed point on
+# all of them: a constructed config stores the bare model plus the resolved
+# provider, and feeding those back in must reproduce the same config — that is
+# what replace(), from_dict() and every Agent(config, override=...) rely on.
+_MODEL_ID_SHAPES = [
+    "claude-opus-5",              # inferred
+    "gpt-5",                      # inferred
+    "anthropic:claude-opus-5",    # explicit, agrees with inference
+    "openai:claude-opus-5",       # explicit, overrides inference (gateway)
+    "openai:llama-3.3-70b",       # explicit, nothing to infer from
+    "openai:llama3.2:3b",         # explicit, colon inside the model name (Ollama tag)
+]
+
+
+@pytest.fixture
+def _quiet_unknown_windows():
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Unknown context window")
+        yield
+
+
+@pytest.mark.usefixtures("_quiet_unknown_windows")
+@pytest.mark.parametrize("model_id", _MODEL_ID_SHAPES)
+def test_normalization_is_idempotent(model_id):
+    config = cfg(model=model_id)
+    rebuilt = AgentConfig(
+        **{f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
+    )
+    assert rebuilt == config
+
+
+@pytest.mark.usefixtures("_quiet_unknown_windows")
+@pytest.mark.parametrize("model_id", _MODEL_ID_SHAPES)
+def test_replace_works_for_every_model_id_shape(model_id):
+    derived = cfg(model=model_id).replace(max_turns=2)
+    assert derived.max_turns == 2
+    assert derived.provider == cfg(model=model_id).provider
+
+
+@pytest.mark.usefixtures("_quiet_unknown_windows")
+@pytest.mark.parametrize("model_id", _MODEL_ID_SHAPES)
+def test_to_dict_round_trips_every_model_id_shape(model_id):
+    config = cfg(model=model_id)
+    assert AgentConfig.from_dict(config.to_dict()) == config.replace(api_key=None)
+
+
+def test_from_env_accepts_a_provider_for_an_unprefixed_model(monkeypatch):
+    monkeypatch.setenv("AGENT_MODEL", "llama-3.3-70b")
+    monkeypatch.setenv("AGENT_PROVIDER", "openai")
+    monkeypatch.setenv("AGENT_CONTEXT_WINDOW", "32768")
+    config = AgentConfig.from_env()
+    assert (config.provider, config.model) == ("openai", "llama-3.3-70b")
 
 
 def test_unresolvable_model_is_rejected_at_construction():

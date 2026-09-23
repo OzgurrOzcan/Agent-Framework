@@ -28,6 +28,7 @@ from agent_framework.providers.catalog import (
     ProviderSpec,
     get_provider,
     resolve_model,
+    split_model_id,
 )
 
 # Re-exported for callers who budget context themselves.
@@ -133,8 +134,10 @@ class AgentConfig:
     api_key: str | None = None
     # Point at any OpenAI-compatible endpoint (vLLM, a proxy, a gateway).
     base_url: str | None = None
-    # None = infer from the model id. Set it to override, or to name a
-    # provider whose models carry no recognizable prefix.
+    # None = infer from the model id. Set it to override inference (Claude
+    # through an OpenAI-compatible gateway), or to name the provider of a
+    # model that carries no recognizable prefix. Equivalent to writing
+    # "provider:model"; the two may appear together only if they agree.
     provider: str | None = None
     stall_threshold: int = 3
     max_tokens_per_response: int = 4096
@@ -166,13 +169,25 @@ class AgentConfig:
 
     # ---------------- normalization + validation ----------------
     def __post_init__(self) -> None:
-        spec, bare_model = resolve_model(self.model)
-        if self.provider is not None and self.provider != spec.name:
+        # An explicit provider — a "provider:" prefix or the `provider` field —
+        # is authoritative, and inference runs only when neither is given.
+        # That is what makes normalization idempotent: a constructed config
+        # stores the bare model plus the resolved provider, and feeding those
+        # two fields back in (replace, from_dict, from_env) must reproduce the
+        # same config — including for a model no provider's prefixes claim,
+        # which re-inferring from the bare name could never resolve.
+        prefix, bare_model = split_model_id(self.model)
+        if prefix is not None and self.provider is not None and prefix != self.provider:
             raise ValueError(
-                f"Model id {self.model!r} resolves to provider {spec.name!r}, "
-                f"which contradicts provider={self.provider!r}. Drop one of "
-                "the two, or make them agree."
+                f"Model id {self.model!r} names provider {prefix!r}, which "
+                f"contradicts provider={self.provider!r}. Drop one of the two, "
+                "or make them agree."
             )
+        explicit = prefix if prefix is not None else self.provider
+        if explicit is not None:
+            spec = get_provider(explicit)
+        else:
+            spec, bare_model = resolve_model(self.model)
         # Frozen dataclass: normalize through object.__setattr__ so that after
         # construction `model` is always the wire name and `provider` is
         # always resolved.

@@ -111,6 +111,13 @@ def test_misspelled_provider_prefix_says_so():
         resolve_model("nope:gpt-5")
 
 
+def test_an_ollama_tag_is_steered_to_the_explicit_form():
+    """Ollama names always carry a colon; the fix is a prefix, not a provider."""
+    with pytest.raises(ProviderResolutionError) as exc:
+        resolve_model("llama3.2:3b")
+    assert '"openai:llama3.2:3b"' in str(exc.value)
+
+
 def test_provider_without_a_model_is_rejected():
     with pytest.raises(ProviderResolutionError, match="no model"):
         resolve_model("anthropic:")
@@ -208,6 +215,9 @@ def test_model_ids_may_contain_a_colon_after_the_provider(custom_provider):
         ("gpt-4-turbo", 128_000),
         ("o1", 200_000),
         ("o3-mini", 200_000),
+        # Prefixes the catalog claims must also be budgetable.
+        ("o4-mini", 200_000),
+        ("chatgpt-4o-latest", 128_000),
     ],
 )
 def test_context_windows_match_the_known_models(model_id, window):

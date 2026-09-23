@@ -175,6 +175,19 @@ def test_a_sub_agent_is_one_line():
     assert parent.config.system_prompt == "parent"
 
 
+@pytest.mark.parametrize(
+    "model_id", ["openai:llama-3.3-70b", "openai:claude-opus-5", "openai:llama3.2:3b"]
+)
+def test_a_sub_agent_is_one_line_for_explicit_model_ids(model_id):
+    """The headline pattern must hold for local and gateway models too."""
+    base = AgentConfig(
+        model=model_id, base_url="http://127.0.0.1:1/v1", context_window=32_768
+    )
+    child = Agent(base, system_prompt="Summarize.", max_turns=2)
+    assert child.config.provider == "openai"
+    assert child.config.model == base.model
+
+
 def test_an_override_is_validated():
     with pytest.raises(ValueError, match="max_turns"):
         Agent("claude-opus-5", api_key="k", max_turns=0)
