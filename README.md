@@ -14,7 +14,7 @@
     <img src="https://github.com/OzgurrOzcan/Agent-Framework/actions/workflows/ci.yml/badge.svg" alt="CI">
   </a>
   <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12-blue" alt="Python 3.11 | 3.12">
-  <img src="https://img.shields.io/badge/tests-436%20passing-brightgreen" alt="436 tests passing">
+  <img src="https://img.shields.io/badge/tests-437%20passing-brightgreen" alt="437 tests passing">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
   <img src="https://img.shields.io/badge/typed-py.typed-informational" alt="Typed">
 </p>
@@ -148,7 +148,7 @@ provider declares (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`), or passed explicitly
 `Agent(..., api_key=...)`.
 
 ```bash
-pytest agent_framework/tests/ -q      # 436 tests, fully offline against mocked providers
+pytest agent_framework/tests/ -q      # 437 tests, fully offline against mocked providers
 ```
 
 No key is required to run the test suite.
@@ -550,7 +550,7 @@ nothing else in the framework to touch.
 
 ## Project status
 
-`0.1.0` — the core is stable and covered by **436 tests** that run fully offline, including
+`0.1.0` — the core is stable and covered by **437 tests** that run fully offline, including
 golden-request tests that pin both providers' wire formats. CI runs lint and the full
 suite on Python 3.11 and 3.12.
 
