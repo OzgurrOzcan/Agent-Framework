@@ -688,3 +688,38 @@ async def test_connect_leaves_a_multi_error_group_intact(monkeypatch):
     )
     with pytest.raises(ExceptionGroup):
         await _stdio_client().connect()
+
+
+# ---------------------------------------------------------------------------
+# retry backoff
+# ---------------------------------------------------------------------------
+
+async def test_retry_does_not_sleep_after_the_final_attempt(monkeypatch, mcp_backoff):
+    """It used to wait 0.5 + 1 + 2s before raising; the last 2s bought nothing
+    but a slower boot failure."""
+    state = _install_handshake_fake(monkeypatch, handshake=_always_fail)
+    with pytest.raises(TimeoutError):
+        await MCPServerRegistry()._connect_with_retry("srv", _stdio_client(), max_attempts=3)
+    assert state["handshakes"] == 3
+    assert mcp_backoff == [0.5, 1.0]
+
+
+async def test_a_single_attempt_never_sleeps(monkeypatch, mcp_backoff):
+    _install_handshake_fake(monkeypatch, handshake=_always_fail)
+    with pytest.raises(TimeoutError):
+        await MCPServerRegistry()._connect_with_retry("srv", _stdio_client(), max_attempts=1)
+    assert mcp_backoff == []
+
+
+async def test_backoff_stops_once_an_attempt_succeeds(monkeypatch, mcp_backoff):
+    async def fail_then_succeed(n: int) -> None:
+        if n == 1:
+            raise TimeoutError("first handshake times out")
+
+    _install_handshake_fake(monkeypatch, handshake=fail_then_succeed)
+    client = _stdio_client()
+    await MCPServerRegistry()._connect_with_retry("srv", client, max_attempts=3)
+    try:
+        assert mcp_backoff == [0.5]
+    finally:
+        await client.close()

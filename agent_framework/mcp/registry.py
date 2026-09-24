@@ -132,7 +132,10 @@ class MCPServerRegistry:
                 return
             except Exception as exc:
                 last_exc = exc
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 5.0)
+                # Back off only when another attempt follows: sleeping after
+                # the last one just delays the failure by the longest wait.
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 5.0)
         if last_exc is not None:
             raise last_exc
