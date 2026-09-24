@@ -16,9 +16,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
+        # The mcp extra is installed so the MCP tests run against the real
+        # SDK rather than only against fakes of it — a fake modelling an old
+        # SDK once let an HTTP transport that never worked pass CI.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,mcp]"
       - name: Lint (errors only)
         run: ruff check agent_framework/ --select F,E9
       - name: Tests

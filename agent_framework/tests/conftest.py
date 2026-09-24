@@ -77,3 +77,29 @@ def make_loop(anthropic_config):
             agent_id="test",
         )
     return _make
+
+
+@pytest.fixture
+def mcp_backoff(monkeypatch):
+    """Record the MCP registry's retry backoff instead of sleeping through it.
+
+    Returns the list of delays the registry would have slept. The patch is
+    scoped to the registry module's own `asyncio` name, so nothing else — not
+    the event loop, not an in-process server on another thread — is affected.
+    """
+    import asyncio
+
+    from agent_framework.mcp import registry as registry_module
+
+    delays: list[float] = []
+
+    class _RecordingAsyncio:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        async def sleep(self, delay, result=None):
+            delays.append(delay)
+            return result
+
+    monkeypatch.setattr(registry_module, "asyncio", _RecordingAsyncio())
+    return delays
