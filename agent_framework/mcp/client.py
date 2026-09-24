@@ -8,7 +8,9 @@ Python package — the rest of the framework functions fine without it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import warnings
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -100,7 +102,6 @@ class MCPClient:
             if self._session is not None:
                 return
             try:
-                from contextlib import AsyncExitStack
                 from mcp import ClientSession
             except ImportError as e:
                 raise ImportError(
@@ -108,55 +109,70 @@ class MCPClient:
                     "`pip install mcp`."
                 ) from e
 
-            self._exit_stack = AsyncExitStack()
-            await self._exit_stack.__aenter__()
+            # Nothing is published until the handshake succeeds. Assigning
+            # `_session` before `initialize()` made a failed handshake look like
+            # a live connection: `connected` turned True, the next attempt in
+            # `_connect_with_retry` returned "success" without handshaking, and
+            # the transport — for stdio, a subprocess — was never closed.
+            stack = AsyncExitStack()
+            try:
+                read, write = await self._open_transport(stack)
+                session = await stack.enter_async_context(ClientSession(read, write))
+                await asyncio.wait_for(
+                    session.initialize(), timeout=self.config.init_timeout_seconds
+                )
+            except BaseException:
+                # Tear down whatever was opened, cancellation included, without
+                # letting a cleanup error mask the failure that got us here.
+                with contextlib.suppress(Exception):
+                    await stack.aclose()
+                raise
+            self._exit_stack = stack
+            self._session = session
 
-            if self.config.transport == "stdio":
-                from mcp.client.stdio import StdioServerParameters, stdio_client
-                if not self.config.command:
-                    raise ValueError("stdio transport requires `command`")
-                params = StdioServerParameters(
-                    command=self.config.command[0],
-                    args=self.config.command[1:],
-                    # None means "inherit the SDK's default environment";
-                    # do not collapse it to {}.
-                    env=self.config.env,
-                    # Several servers resolve relative paths and sandbox roots
-                    # against their own working directory, so `cwd` has to reach
-                    # the subprocess rather than sit unused on the config.
-                    cwd=self.config.cwd,
-                )
-                read, write = await self._exit_stack.enter_async_context(stdio_client(params))
-            elif self.config.transport in ("http", "streamable_http"):
-                import mcp.client.streamable_http as _sh
-                # mcp>=2 renamed `streamablehttp_client` to `streamable_http_client`.
-                http_client = getattr(_sh, "streamable_http_client", None) or _sh.streamablehttp_client
-                if not self.config.url:
-                    raise ValueError(f"{self.config.transport} transport requires `url`")
-                read, write, _ = await self._exit_stack.enter_async_context(
-                    http_client(self.config.url, headers=self.config.auth_headers)
-                )
-            elif self.config.transport == "sse":
-                warnings.warn(
-                    "SSE transport is deprecated in MCP; prefer 'http' "
-                    "(streamable HTTP).",
-                    DeprecationWarning,
-                )
-                from mcp.client.sse import sse_client
-                if not self.config.url:
-                    raise ValueError(f"{self.config.transport} transport requires `url`")
-                read, write = await self._exit_stack.enter_async_context(
-                    sse_client(self.config.url, headers=self.config.auth_headers)
-                )
-            else:
-                raise ValueError(f"Unsupported transport: {self.config.transport}")
-
-            self._session = await self._exit_stack.enter_async_context(
-                ClientSession(read, write)
+    async def _open_transport(self, stack: AsyncExitStack) -> tuple[Any, Any]:
+        """Enter the configured transport on *stack*; return (read, write)."""
+        if self.config.transport == "stdio":
+            from mcp.client.stdio import StdioServerParameters, stdio_client
+            if not self.config.command:
+                raise ValueError("stdio transport requires `command`")
+            params = StdioServerParameters(
+                command=self.config.command[0],
+                args=self.config.command[1:],
+                # None means "inherit the SDK's default environment";
+                # do not collapse it to {}.
+                env=self.config.env,
+                # Several servers resolve relative paths and sandbox roots
+                # against their own working directory, so `cwd` has to reach
+                # the subprocess rather than sit unused on the config.
+                cwd=self.config.cwd,
             )
-            await asyncio.wait_for(
-                self._session.initialize(), timeout=self.config.init_timeout_seconds
+            read, write = await stack.enter_async_context(stdio_client(params))
+            return read, write
+        if self.config.transport in ("http", "streamable_http"):
+            import mcp.client.streamable_http as _sh
+            # mcp>=2 renamed `streamablehttp_client` to `streamable_http_client`.
+            http_client = getattr(_sh, "streamable_http_client", None) or _sh.streamablehttp_client
+            if not self.config.url:
+                raise ValueError(f"{self.config.transport} transport requires `url`")
+            read, write, _ = await stack.enter_async_context(
+                http_client(self.config.url, headers=self.config.auth_headers)
             )
+            return read, write
+        if self.config.transport == "sse":
+            warnings.warn(
+                "SSE transport is deprecated in MCP; prefer 'http' "
+                "(streamable HTTP).",
+                DeprecationWarning,
+            )
+            from mcp.client.sse import sse_client
+            if not self.config.url:
+                raise ValueError(f"{self.config.transport} transport requires `url`")
+            read, write = await stack.enter_async_context(
+                sse_client(self.config.url, headers=self.config.auth_headers)
+            )
+            return read, write
+        raise ValueError(f"Unsupported transport: {self.config.transport}")
 
     async def close(self) -> None:
         async with self._lock:

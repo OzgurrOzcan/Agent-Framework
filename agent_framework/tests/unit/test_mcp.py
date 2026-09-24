@@ -357,3 +357,155 @@ async def test_stdio_transport_passes_explicit_env(monkeypatch):
         assert calls["stdio_params"].kwargs["env"] == {"FOO": "bar"}
     finally:
         await client.close()
+
+
+# ---------------------------------------------------------------------------
+# connect() failure path — nothing is published until the handshake succeeds
+# ---------------------------------------------------------------------------
+
+class _RecordingTransport:
+    """Transport CM that records whether it was torn down."""
+
+    def __init__(self, log: list[str], *, fail_on_enter: bool = False) -> None:
+        self._log = log
+        self._fail = fail_on_enter
+
+    async def __aenter__(self) -> Any:
+        if self._fail:
+            raise ConnectionRefusedError("transport could not open")
+        self._log.append("opened")
+        return ("read", "write")
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        self._log.append("closed")
+        return False
+
+
+def _install_handshake_fake(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    handshake: Any,
+    fail_on_enter: bool = False,
+) -> dict[str, Any]:
+    """Fake SDK whose stdio transport records teardown and whose
+    `initialize()` is *handshake* (an async callable)."""
+    state: dict[str, Any] = {"log": [], "handshakes": 0}
+
+    class _Session:
+        def __init__(self, read: Any, write: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_Session":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            state["log"].append("session-closed")
+            return False
+
+        async def initialize(self) -> None:
+            state["handshakes"] += 1
+            await handshake(state["handshakes"])
+
+    calls = _install_fake_mcp(monkeypatch)
+    monkeypatch.setattr(sys.modules["mcp"], "ClientSession", _Session)
+    monkeypatch.setattr(
+        sys.modules["mcp.client.stdio"],
+        "stdio_client",
+        lambda params: _RecordingTransport(state["log"], fail_on_enter=fail_on_enter),
+    )
+    state["calls"] = calls
+    return state
+
+
+def _stdio_client() -> MCPClient:
+    return MCPClient(name="srv", config=MCPConnectionConfig(transport="stdio", command=["x"]))
+
+
+async def _always_fail(n: int) -> None:
+    raise TimeoutError("server never answered initialize")
+
+
+async def test_a_failed_handshake_leaves_the_client_disconnected(monkeypatch):
+    """It used to report connected=True with a session that never handshook."""
+    _install_handshake_fake(monkeypatch, handshake=_always_fail)
+    client = _stdio_client()
+    with pytest.raises(TimeoutError):
+        await client.connect()
+    assert client.connected is False
+    assert client._exit_stack is None
+
+
+async def test_a_failed_handshake_tears_down_the_transport(monkeypatch):
+    """For stdio the transport is a subprocess; it must not outlive the failure."""
+    state = _install_handshake_fake(monkeypatch, handshake=_always_fail)
+    with pytest.raises(TimeoutError):
+        await _stdio_client().connect()
+    assert state["log"] == ["opened", "session-closed", "closed"]
+
+
+async def test_a_retry_after_a_failed_handshake_handshakes_again(monkeypatch):
+    """The retry used to return "success" without ever handshaking."""
+
+    async def fail_then_succeed(n: int) -> None:
+        if n == 1:
+            raise TimeoutError("first handshake times out")
+
+    state = _install_handshake_fake(monkeypatch, handshake=fail_then_succeed)
+    client = _stdio_client()
+    with pytest.raises(TimeoutError):
+        await client.connect()
+    await client.connect()
+    try:
+        assert state["handshakes"] == 2
+        assert client.connected
+    finally:
+        await client.close()
+
+
+async def test_a_transport_that_cannot_open_leaves_nothing_behind(monkeypatch):
+    state = _install_handshake_fake(
+        monkeypatch, handshake=_always_fail, fail_on_enter=True
+    )
+    client = _stdio_client()
+    with pytest.raises(ConnectionRefusedError):
+        await client.connect()
+    assert client.connected is False
+    assert state["handshakes"] == 0
+
+
+async def test_cancellation_during_the_handshake_still_cleans_up(monkeypatch):
+    import asyncio
+
+    started = asyncio.Event()
+
+    async def hang(n: int) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    state = _install_handshake_fake(monkeypatch, handshake=hang)
+    client = _stdio_client()
+    task = asyncio.create_task(client.connect())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.connected is False
+    assert state["log"][-1] == "closed"
+
+
+async def test_the_registry_retry_now_really_reconnects(monkeypatch):
+    """What strict discovery (and so Agent.connect) relies on at boot."""
+
+    async def fail_then_succeed(n: int) -> None:
+        if n == 1:
+            raise TimeoutError("first handshake times out")
+
+    state = _install_handshake_fake(monkeypatch, handshake=fail_then_succeed)
+    registry = MCPServerRegistry()
+    client = _stdio_client()
+    await registry._connect_with_retry("srv", client, max_attempts=2)
+    try:
+        assert state["handshakes"] == 2
+        assert client.connected
+    finally:
+        await client.close()
