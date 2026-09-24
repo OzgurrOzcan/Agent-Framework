@@ -122,6 +122,27 @@ Other behaviour changes:
 
 ### Fixed
 
+- **MCP servers over HTTP connect again.** Every `transport="http"` connection
+  failed with `TypeError: streamable_http_client() got an unexpected keyword
+  argument 'headers'`: the SDK renamed its streamable HTTP client and changed
+  how it is called in the same step, and the framework called the new name the
+  old way. This affected every SDK release since the rename — mcp 1.30 as well
+  as 2.0 — though stdio servers were unaffected. `auth_headers` now travel on
+  an HTTP client built by the SDK's own factory, and both SDK generations are
+  supported.
+- **A failed MCP handshake is no longer mistaken for a connection.** The client
+  published its session before the handshake finished, so a server that
+  accepted the connection but failed or timed out the handshake left it
+  reporting `connected=True`; the retry then "succeeded" without handshaking,
+  and the transport — for stdio, the server subprocess — was never torn down.
+  Nothing is published until the handshake completes, and a failure closes
+  everything it opened.
+- **MCP connection errors name their cause.** The SDK's transports report even
+  a single failure as a nested `ExceptionGroup`, so errors read "unhandled
+  errors in a TaskGroup (1 sub-exception)". The one real error — a 401, a
+  refused connection — is now surfaced; genuine multi-error groups are kept.
+- **A failed MCP boot is reported 2s sooner.** The retry loop also slept after
+  its final attempt, where no retry can follow.
 - **Closing a stream early no longer bricks the agent.** `run_stream()` never
   closed the loop's own generator, so after a consumer stopped early — a "stop
   generating" button — the run-in-progress flag stayed set and every later
