@@ -159,7 +159,7 @@ class OpenAIAdapter(BaseProviderAdapter):
             req["tools"] = [self.tool_schema(t) for t in tools]
             # Learned once per model from the API's own 400 — see
             # `_is_tools_vs_reasoning_effort_error`. `extra` is applied last, so
-            # provider_extra can always override this.
+            # request_extra can always override this.
             if model in self._tools_need_effort_none:
                 req["reasoning_effort"] = "none"
         if tool_choice is not None:

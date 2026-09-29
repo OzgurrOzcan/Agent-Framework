@@ -1,6 +1,6 @@
 """Tests for the core agent loop using MockLLMProvider (no API calls)."""
 import pytest
-from agent_framework.core.config import AgentConfig, ProviderConfig, ProviderKind
+from agent_framework.core.config import AgentConfig
 from agent_framework.core.loop import AgentLoop
 from agent_framework.core.policy import LoopPolicy
 from agent_framework.core.context_manager import ContextManager
@@ -21,11 +21,8 @@ def _make_loop(mock: MockLLMProvider, tools: list | None = None) -> AgentLoop:
     registry = ToolRegistry(tools or [])
     trace = ExecutionTrace(agent_id="test")
     config = AgentConfig(
-        provider=ProviderConfig(
-            provider=ProviderKind.ANTHROPIC,
-            model="claude-opus-4-7",
-            api_key="test",
-        ),
+        model="claude-opus-4-7",
+        api_key="test",
         system_prompt="You are a test agent.",
         max_turns=10,
         stall_threshold=3,

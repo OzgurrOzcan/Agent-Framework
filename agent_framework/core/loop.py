@@ -18,10 +18,11 @@ Design laws enforced here:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any, AsyncGenerator
 
 from agent_framework.core.config import AgentConfig
 from agent_framework.core.context_manager import ContextManager
@@ -102,6 +103,27 @@ class AgentResult:
         return []
 
 
+def _policy_payload(policy: LoopPolicy, *, streaming: bool) -> dict[str, Any]:
+    """The effective shape of one run, for the RUN span.
+
+    `AgentConfig` records the defaults, but `run(max_turns=3)` overrides them
+    per call — so these values are recoverable from nowhere else. Without them
+    a trace cannot distinguish "the caller capped this run" from "the deployed
+    config changed", nor `max_tool_rounds` from a permission wall when a turn
+    requests tools and none execute.
+    """
+    choice = policy.tool_choice
+    return {
+        "max_turns": policy.max_turns,
+        # None = unlimited (bounded only by max_turns).
+        "max_tool_rounds": policy.max_tool_rounds,
+        "execute_tools": policy.execute_tools,
+        "tool_choice": choice.mode if choice is not None else None,
+        "tool_choice_name": choice.tool_name if choice is not None else None,
+        "streaming": streaming,
+    }
+
+
 class AgentLoop:
     """The core engine. One instance per agent."""
 
@@ -170,7 +192,25 @@ class AgentLoop:
     ) -> AgentResult:
         self._acquire_run()
         try:
-            return await self._run_inner(user_input, policy=policy)
+            # One RUN span per run, so every turn below it is attributable to
+            # the policy that shaped it (session = how the agent was built).
+            with self.trace.start_span(
+                EventType.RUN,
+                name="run",
+                payload=_policy_payload(policy, streaming=False),
+            ) as run_span:
+                result = await self._run_inner(user_input, policy=policy)
+                run_span.update(
+                    stop_reason=result.stop_reason.value,
+                    turns=result.state.turn,
+                    tool_rounds=result.state.tool_rounds,
+                    cost_usd=result.state.cumulative_cost_usd,
+                )
+                # The loop turns operational failures into AgentResult.error
+                # rather than raising, so the span has to be marked by hand.
+                if result.error is not None:
+                    run_span.set_error(result.error)
+                return result
         finally:
             self._running = False
 
@@ -231,7 +271,7 @@ class AgentLoop:
                                 temperature=self.config.temperature,
                                 tool_choice=self._tool_choice_for_turn(policy, state.turn),
                                 enable_caching=self.config.enable_prompt_caching,
-                                extra=self.config.provider_extra or None,
+                                extra=self.config.request_extra or None,
                             )
                         except asyncio.CancelledError:
                             raise
@@ -419,11 +459,52 @@ class AgentLoop:
         user_input: str,
         *,
         policy: LoopPolicy,
-    ) -> AsyncIterator[StreamChunk]:
+    ) -> AsyncGenerator[StreamChunk, None]:
         self._acquire_run()
+        # Owned here rather than inside _stream_inner so the RUN span can
+        # report this run's own numbers; the trace-wide turn counter is
+        # cumulative across runs.
+        state = LoopState()
         try:
-            async for chunk in self._stream_inner(user_input, policy=policy):
-                yield chunk
+            with self.trace.start_span(
+                EventType.RUN,
+                name="run",
+                payload=_policy_payload(policy, streaming=True),
+            ) as run_span:
+                try:
+                    # aclosing: if our consumer closes the stream early, close
+                    # the inner generator now, so its spans end and its
+                    # cleanup runs instead of waiting for garbage collection.
+                    async with contextlib.aclosing(
+                        self._stream_inner(user_input, policy=policy, state=state)
+                    ) as chunks:
+                        async for chunk in chunks:
+                            if chunk.type is StreamChunkType.ERROR:
+                                # Streaming reports failure as an ERROR chunk,
+                                # not an AgentResult, so mark the span here.
+                                # Provider chunks are forwarded verbatim, so
+                                # do not trust the payload's shape: tracing
+                                # must never break the stream it observes.
+                                payload = chunk.payload
+                                reason = (
+                                    payload.get("reason", "")
+                                    if isinstance(payload, dict)
+                                    else payload
+                                )
+                                run_span.set_error(
+                                    ErrorInfo(
+                                        exception_type="StreamError",
+                                        message=str(reason),
+                                        traceback="",
+                                    )
+                                )
+                            yield chunk
+                finally:
+                    run_span.update(
+                        turns=state.turn,
+                        tool_rounds=state.tool_rounds,
+                        cost_usd=state.cumulative_cost_usd,
+                    )
         finally:
             self._running = False
 
@@ -432,8 +513,8 @@ class AgentLoop:
         user_input: str,
         *,
         policy: LoopPolicy,
-    ) -> AsyncIterator[StreamChunk]:
-        state = LoopState()
+        state: LoopState,
+    ) -> AsyncGenerator[StreamChunk, None]:
         self.short_term.append(UserMessage(content=user_input))
 
         try:
@@ -476,7 +557,7 @@ class AgentLoop:
                             temperature=self.config.temperature,
                             tool_choice=self._tool_choice_for_turn(policy, state.turn),
                             enable_caching=self.config.enable_prompt_caching,
-                            extra=self.config.provider_extra or None,
+                            extra=self.config.request_extra or None,
                         ):
                             yield chunk
                             ctype = chunk.type

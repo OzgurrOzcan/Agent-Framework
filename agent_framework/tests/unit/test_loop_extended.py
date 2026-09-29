@@ -8,7 +8,7 @@ import asyncio
 
 import pytest
 
-from agent_framework.core.config import AgentConfig, CompactionConfig, ProviderConfig, ProviderKind
+from agent_framework.core.config import AgentConfig, CompactionConfig
 from agent_framework.core.context_manager import ContextManager
 from agent_framework.core.loop import AgentLoop
 from agent_framework.core.message import (
@@ -43,9 +43,8 @@ def make_loop(
     registry = ToolRegistry(tools or [])
     trace = ExecutionTrace(agent_id="test")
     config = AgentConfig(
-        provider=ProviderConfig(
-            provider=ProviderKind.ANTHROPIC, model="claude-opus-5", api_key="test",
-        ),
+        model="claude-opus-5",
+        api_key="test",
         system_prompt="You are a test agent.",
         max_turns=10,
         stall_threshold=3,

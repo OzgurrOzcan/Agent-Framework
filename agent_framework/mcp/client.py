@@ -1,14 +1,16 @@
 """MCPClient — lifecycle of a single MCP server connection.
 
 Supports `stdio` (local subprocess), `http`/`streamable_http` (streamable
-HTTP) and deprecated `sse` transports. Soft dependency on the `mcp`
-Python package — the rest of the framework functions fine without it.
+HTTP) and deprecated `sse` transports, on both `mcp<2` and `mcp>=2`. Soft
+dependency on the `mcp` Python package — the rest of the framework functions
+fine without it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import warnings
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -66,6 +68,19 @@ def _normalize_annotations(raw: Any) -> dict[str, Any]:
     return dict(getattr(raw, "__dict__", {}))
 
 
+def _sole_error(exc: BaseException) -> Exception | None:
+    """The single error inside nested one-member exception groups, else None.
+
+    None when some level holds several errors, or when the innermost member
+    is not an `Exception` (a real cancellation must propagate untouched).
+    """
+    while isinstance(exc, BaseExceptionGroup) and len(exc.exceptions) == 1:
+        exc = exc.exceptions[0]
+    if isinstance(exc, BaseExceptionGroup) or not isinstance(exc, Exception):
+        return None
+    return exc
+
+
 @dataclass
 class MCPToolDescriptor:
     """Description of a tool advertised by an MCP server."""
@@ -100,7 +115,6 @@ class MCPClient:
             if self._session is not None:
                 return
             try:
-                from contextlib import AsyncExitStack
                 from mcp import ClientSession
             except ImportError as e:
                 raise ImportError(
@@ -108,55 +122,113 @@ class MCPClient:
                     "`pip install mcp`."
                 ) from e
 
-            self._exit_stack = AsyncExitStack()
-            await self._exit_stack.__aenter__()
+            # Nothing is published until the handshake succeeds. Assigning
+            # `_session` before `initialize()` made a failed handshake look like
+            # a live connection: `connected` turned True, the next attempt in
+            # `_connect_with_retry` returned "success" without handshaking, and
+            # the transport — for stdio, a subprocess — was never closed.
+            #
+            # On failure the stack must be exited *with* the exception rather
+            # than closed as if nothing happened: an HTTP transport runs an
+            # anyio task group, and when one of its requests fails (a 401, say)
+            # it cancels its scope, which delivers a CancelledError into this
+            # task. Only when that exception passes through the scope's exit can
+            # anyio recognize its own cancellation and raise the real error in
+            # its place — otherwise a rejected token escapes as a spurious
+            # CancelledError, which no caller treats as a connection failure.
+            try:
+                async with AsyncExitStack() as stack:
+                    read, write = await self._open_transport(stack)
+                    session = await stack.enter_async_context(ClientSession(read, write))
+                    await asyncio.wait_for(
+                        session.initialize(), timeout=self.config.init_timeout_seconds
+                    )
+                    # Success: take ownership, so leaving this block closes nothing.
+                    self._exit_stack = stack.pop_all()
+                    self._session = session
+            except BaseExceptionGroup as group:
+                # The task group reports even a single failure as a group, often
+                # nested, so the cause reads "unhandled errors in a TaskGroup (1
+                # sub-exception)" instead of "401 Unauthorized". That wrapper is
+                # an SDK implementation detail; surface the one real error.
+                # Genuine multi-error groups are left intact.
+                leaf = _sole_error(group)
+                if leaf is None:
+                    raise
+                raise leaf from None
 
-            if self.config.transport == "stdio":
-                from mcp.client.stdio import StdioServerParameters, stdio_client
-                if not self.config.command:
-                    raise ValueError("stdio transport requires `command`")
-                params = StdioServerParameters(
-                    command=self.config.command[0],
-                    args=self.config.command[1:],
-                    # None means "inherit the SDK's default environment";
-                    # do not collapse it to {}.
-                    env=self.config.env,
-                    # Several servers resolve relative paths and sandbox roots
-                    # against their own working directory, so `cwd` has to reach
-                    # the subprocess rather than sit unused on the config.
-                    cwd=self.config.cwd,
-                )
-                read, write = await self._exit_stack.enter_async_context(stdio_client(params))
-            elif self.config.transport in ("http", "streamable_http"):
-                import mcp.client.streamable_http as _sh
-                # mcp>=2 renamed `streamablehttp_client` to `streamable_http_client`.
-                http_client = getattr(_sh, "streamable_http_client", None) or _sh.streamablehttp_client
-                if not self.config.url:
-                    raise ValueError(f"{self.config.transport} transport requires `url`")
-                read, write, _ = await self._exit_stack.enter_async_context(
-                    http_client(self.config.url, headers=self.config.auth_headers)
-                )
-            elif self.config.transport == "sse":
-                warnings.warn(
-                    "SSE transport is deprecated in MCP; prefer 'http' "
-                    "(streamable HTTP).",
-                    DeprecationWarning,
-                )
-                from mcp.client.sse import sse_client
-                if not self.config.url:
-                    raise ValueError(f"{self.config.transport} transport requires `url`")
-                read, write = await self._exit_stack.enter_async_context(
-                    sse_client(self.config.url, headers=self.config.auth_headers)
-                )
-            else:
-                raise ValueError(f"Unsupported transport: {self.config.transport}")
+    async def _open_transport(self, stack: AsyncExitStack) -> tuple[Any, Any]:
+        """Enter the configured transport on *stack*; return (read, write)."""
+        if self.config.transport == "stdio":
+            from mcp.client.stdio import StdioServerParameters, stdio_client
+            if not self.config.command:
+                raise ValueError("stdio transport requires `command`")
+            params = StdioServerParameters(
+                command=self.config.command[0],
+                args=self.config.command[1:],
+                # None means "inherit the SDK's default environment";
+                # do not collapse it to {}.
+                env=self.config.env,
+                # Several servers resolve relative paths and sandbox roots
+                # against their own working directory, so `cwd` has to reach
+                # the subprocess rather than sit unused on the config.
+                cwd=self.config.cwd,
+            )
+            read, write = await stack.enter_async_context(stdio_client(params))
+            return read, write
+        if self.config.transport in ("http", "streamable_http"):
+            if not self.config.url:
+                raise ValueError(f"{self.config.transport} transport requires `url`")
+            streams = await self._open_streamable_http(stack, self.config.url)
+            # mcp>=2 yields (read, write); mcp<2 appended a get_session_id
+            # callable. Index rather than unpack so both shapes work.
+            return streams[0], streams[1]
+        if self.config.transport == "sse":
+            warnings.warn(
+                "SSE transport is deprecated in MCP; prefer 'http' "
+                "(streamable HTTP).",
+                DeprecationWarning,
+            )
+            from mcp.client.sse import sse_client
+            if not self.config.url:
+                raise ValueError(f"{self.config.transport} transport requires `url`")
+            read, write = await stack.enter_async_context(
+                sse_client(self.config.url, headers=self.config.auth_headers)
+            )
+            return read, write
+        raise ValueError(f"Unsupported transport: {self.config.transport}")
 
-            self._session = await self._exit_stack.enter_async_context(
-                ClientSession(read, write)
+    async def _open_streamable_http(self, stack: AsyncExitStack, url: str) -> Any:
+        """Enter the streamable HTTP transport, for either SDK generation.
+
+        mcp 2 renamed `streamablehttp_client` to `streamable_http_client` and
+        also changed how it is called — it no longer takes `headers=`, and
+        yields a 2-tuple instead of a 3-tuple. Selecting the new name but
+        calling it the old way made every HTTP server fail with a TypeError.
+        """
+        import mcp.client.streamable_http as _sh
+
+        modern = getattr(_sh, "streamable_http_client", None)
+        if modern is None:
+            # mcp<2: headers are an argument of the transport itself.
+            legacy = _sh.streamablehttp_client  # type: ignore[attr-defined]
+            return await stack.enter_async_context(
+                legacy(url, headers=self.config.auth_headers)
             )
-            await asyncio.wait_for(
-                self._session.initialize(), timeout=self.config.init_timeout_seconds
-            )
+
+        # mcp>=2: headers travel on a pre-built HTTP client. The SDK's own
+        # factory is used because it returns the client class that SDK version
+        # expects (`httpx2` in mcp 2, not `httpx`) with MCP's recommended
+        # timeouts, including a long read timeout for streamed responses.
+        # The SDK does not close a client it was handed, so it goes on our
+        # stack — entered first, so that the transport, which sends the
+        # session-terminating DELETE on close, is torn down before its client.
+        from mcp.shared._httpx_utils import create_mcp_http_client
+
+        http = await stack.enter_async_context(
+            create_mcp_http_client(headers=self.config.auth_headers or None)
+        )
+        return await stack.enter_async_context(modern(url, http_client=http))
 
     async def close(self) -> None:
         async with self._lock:

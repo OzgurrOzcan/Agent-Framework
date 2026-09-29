@@ -1,6 +1,6 @@
 """Shared pytest fixtures."""
 import pytest
-from agent_framework.core.config import AgentConfig, CompactionConfig, ProviderConfig, ProviderKind
+from agent_framework.core.config import AgentConfig, CompactionConfig
 from agent_framework.core.context_manager import ContextManager
 from agent_framework.memory.short_term import ShortTermMemory
 from agent_framework.permissions.config import PermissionConfig
@@ -16,11 +16,8 @@ from agent_framework.core.loop import AgentLoop
 @pytest.fixture
 def anthropic_config() -> AgentConfig:
     return AgentConfig(
-        provider=ProviderConfig(
-            provider=ProviderKind.ANTHROPIC,
-            model="claude-opus-4-7",
-            api_key="test-key",
-        ),
+        model="claude-opus-4-7",
+        api_key="test-key",
         system_prompt="You are a test agent.",
         max_turns=10,
         stall_threshold=3,
@@ -31,11 +28,8 @@ def anthropic_config() -> AgentConfig:
 @pytest.fixture
 def openai_config() -> AgentConfig:
     return AgentConfig(
-        provider=ProviderConfig(
-            provider=ProviderKind.OPENAI,
-            model="gpt-4o",
-            api_key="test-key",
-        ),
+        model="gpt-4o",
+        api_key="test-key",
         system_prompt="You are a test agent.",
         max_turns=10,
         stall_threshold=3,
@@ -83,3 +77,29 @@ def make_loop(anthropic_config):
             agent_id="test",
         )
     return _make
+
+
+@pytest.fixture
+def mcp_backoff(monkeypatch):
+    """Record the MCP registry's retry backoff instead of sleeping through it.
+
+    Returns the list of delays the registry would have slept. The patch is
+    scoped to the registry module's own `asyncio` name, so nothing else — not
+    the event loop, not an in-process server on another thread — is affected.
+    """
+    import asyncio
+
+    from agent_framework.mcp import registry as registry_module
+
+    delays: list[float] = []
+
+    class _RecordingAsyncio:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        async def sleep(self, delay, result=None):
+            delays.append(delay)
+            return result
+
+    monkeypatch.setattr(registry_module, "asyncio", _RecordingAsyncio())
+    return delays

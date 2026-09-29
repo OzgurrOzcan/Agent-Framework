@@ -11,6 +11,7 @@ returns its ancestor chain.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import enum
 import os
@@ -27,7 +28,12 @@ from agent_framework.core.message import TokenUsage
 
 
 class EventType(str, enum.Enum):
+    # How the agent was built: one per agent, carrying its config snapshot.
     SESSION = "session"
+    # How one run was shaped: one per run()/run_stream()/complete(), carrying
+    # the effective LoopPolicy. Config defaults and per-call overrides can
+    # disagree, so the run is the only place the effective values are known.
+    RUN = "run"
     TURN = "turn"
     LLM_CALL = "llm_call"
     TOOL_CALL = "tool_call"
@@ -211,7 +217,13 @@ class SpanContext:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if exc is not None and not self.event._ended:
-            self.set_error(exc)
+            # Cancellation is how work is stopped, not how it fails: a
+            # cancelled task, or a consumer closing a stream early, must not
+            # read as an error — nor be named by where_it_failed() as a cause.
+            if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+                self.set_error(exc, status=SpanStatus.CANCELLED)
+            else:
+                self.set_error(exc)
         self.end()
         if self._token is not None:
             try:
@@ -471,13 +483,32 @@ class ExecutionTrace:
         }
 
     def where_it_failed(self) -> list[TraceEvent] | None:
-        """First failure span + its ancestor chain (root → failure)."""
+        """The first root-cause failure + its ancestor chain (root → failure).
+
+        A span that failed *because* a descendant failed (a run stopped by its
+        guard, an LLM call wrapping a provider error) is a consequence, not a
+        cause. Such wrappers start before the span that actually failed, so
+        choosing by timestamp alone would always name the outermost wrapper;
+        only failures with no failing descendant are candidates.
+        """
         failures = self.failures()
         if not failures:
             return None
-        target = min(failures, key=lambda s: s.timestamp)
-        chain: list[TraceEvent] = [target]
         by_id = {s.span_id: s for s in self.all_spans()}
+        failed_ids = {s.span_id for s in failures}
+        consequences: set[str] = set()
+        for failure in failures:
+            seen: set[str] = set()
+            parent_id = failure.parent_span_id
+            while parent_id and parent_id not in seen:
+                seen.add(parent_id)
+                if parent_id in failed_ids:
+                    consequences.add(parent_id)
+                parent = by_id.get(parent_id)
+                parent_id = parent.parent_span_id if parent is not None else None
+        causes = [s for s in failures if s.span_id not in consequences]
+        target = min(causes, key=lambda s: s.timestamp)
+        chain: list[TraceEvent] = [target]
         cur = target
         while cur.parent_span_id:
             parent = by_id.get(cur.parent_span_id)

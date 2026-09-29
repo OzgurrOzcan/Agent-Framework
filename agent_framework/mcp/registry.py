@@ -15,6 +15,23 @@ from agent_framework.tools.models import Tool
 from agent_framework.tracing.trace import EventType, ExecutionTrace, SpanStatus
 
 
+class MCPDiscoveryError(RuntimeError):
+    """Strict discovery could not reach or list one or more servers.
+
+    `failures` maps each failed server name to the exception it raised; the
+    first one is also chained as `__cause__`.
+    """
+
+    def __init__(self, failures: dict[str, BaseException]) -> None:
+        self.failures = dict(failures)
+        detail = "; ".join(
+            f"{name}: {type(exc).__name__}: {exc}" for name, exc in self.failures.items()
+        )
+        super().__init__(
+            f"MCP discovery failed for {len(self.failures)} server(s) — {detail}"
+        )
+
+
 class MCPServerRegistry:
     def __init__(self, *, trace: ExecutionTrace | None = None) -> None:
         self._clients: dict[str, MCPClient] = {}
@@ -44,14 +61,25 @@ class MCPServerRegistry:
         for name, client in self._clients.items():
             await self._connect_with_retry(name, client)
 
-    async def discover_all(self) -> list[Tool]:
+    async def discover_all(self, *, strict: bool = False) -> list[Tool]:
+        """Connect to every server and collect its tools.
+
+        By default a server that fails is skipped: the failure is recorded as
+        an `error` trace event and the other servers' tools are still
+        returned, so a run is never crashed by one bad server. With
+        ``strict=True`` every failure is still recorded, and then an
+        `MCPDiscoveryError` naming all failed servers is raised — for start-up,
+        where a silently reduced toolset is worse than a crash.
+        """
         out: list[Tool] = []
+        failures: dict[str, BaseException] = {}
         for name, provider in self._providers.items():
             try:
                 await self._connect_with_retry(name, self._clients[name])
                 tools = await provider.discover()
                 out.extend(tools)
             except Exception as exc:
+                failures[name] = exc
                 if self._trace is not None:
                     from agent_framework.tracing.trace import ErrorInfo
                     self._trace.record_event(
@@ -60,23 +88,28 @@ class MCPServerRegistry:
                         status=SpanStatus.ERROR,
                         error=ErrorInfo.from_exception(exc),
                     )
+        if strict and failures:
+            raise MCPDiscoveryError(failures) from next(iter(failures.values()))
         return out
 
-    def discover_all_sync(self) -> list[Tool]:
-        """Synchronous convenience for `BaseAgent.create()`.
+    def discover_all_sync(self, *, strict: bool = False) -> list[Tool]:
+        """Discover from synchronous code, for eager `tools=` construction:
 
-        Runs `discover_all()` in a new event loop. If an event loop is
-        already running, raises `RuntimeError` — synchronous discovery
-        cannot block inside async code; use `await BaseAgent.acreate(...)`
-        (which awaits `discover_all()`) instead.
+            agent = Agent("claude-opus-5", tools=registry.discover_all_sync())
+
+        Runs `discover_all()` in a new event loop, so it raises `RuntimeError`
+        when one is already running — blocking discovery cannot happen inside
+        async code. From async code use `await registry.discover_all()`, or
+        `await Agent.connect(config, mcp=registry)` to let the agent do it.
         """
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.discover_all())
+            return asyncio.run(self.discover_all(strict=strict))
         raise RuntimeError(
-            "BaseAgent.create(mcp=...) cannot discover MCP tools inside a running "
-            "event loop. Use `await BaseAgent.acreate(...)` instead."
+            "discover_all_sync() cannot run inside a running event loop. "
+            "Use `await registry.discover_all()`, or "
+            "`await Agent.connect(config, mcp=registry)`."
         )
 
     async def close_all(self) -> None:
@@ -99,7 +132,10 @@ class MCPServerRegistry:
                 return
             except Exception as exc:
                 last_exc = exc
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 5.0)
+                # Back off only when another attempt follows: sleeping after
+                # the last one just delays the failure by the longest wait.
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 5.0)
         if last_exc is not None:
             raise last_exc

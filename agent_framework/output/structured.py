@@ -28,7 +28,7 @@ from agent_framework.core.message import UserMessage
 from agent_framework.output.schema_prep import prepare_for_strict, strip_optional_nulls
 
 if TYPE_CHECKING:
-    from agent_framework.core.base_agent import BaseAgent
+    from agent_framework.core.agent import Agent
 
 
 class StructuredOutputError(Exception):
@@ -36,7 +36,7 @@ class StructuredOutputError(Exception):
 
 
 async def generate_structured(
-    agent: "BaseAgent",
+    agent: "Agent",
     prompt: str,
     schema: Any,
     *,
