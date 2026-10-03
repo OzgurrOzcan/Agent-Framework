@@ -14,7 +14,7 @@
     <img src="https://github.com/OzgurrOzcan/Agent-Framework/actions/workflows/ci.yml/badge.svg" alt="CI">
   </a>
   <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12-blue" alt="Python 3.11 | 3.12">
-  <img src="https://img.shields.io/badge/tests-463%20passing-brightgreen" alt="463 tests passing">
+  <img src="https://img.shields.io/badge/tests-626%20passing-brightgreen" alt="626 tests passing">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
   <img src="https://img.shields.io/badge/typed-py.typed-informational" alt="Typed">
 </p>
@@ -41,7 +41,7 @@ And the parts that actually decide whether an agent is *production-ready* are th
 nobody wants to write twice: what stops a runaway loop, which tool may touch what, what
 the last run cost, and — when it breaks at 3am — which turn it broke on.
 
-**Agent Framework** owns exactly those parts, in ~8,000 lines of plain Python you can
+**Agent Framework** owns exactly those parts, in ~11,000 lines of plain Python you can
 read in an afternoon. Switching provider is one line:
 
 ```diff
@@ -65,7 +65,8 @@ Nothing else changes either — not your tools, not your permissions, not your t
 | **Deny-first permissions** | Four categories per tool, overridable by glob and argument-regex rules without touching tool code. Sub-agents can never widen a parent's permissions. |
 | **Human in the loop** | `ASK` tools route to a pluggable renderer — terminal, callback (web UI), or headless (CI) — and `ask_user` lets the agent ask mid-run. |
 | **MCP, first class** | Any stdio or HTTP server in three lines. Tools are namespaced `server__tool` and pass through the same executor, permissions and tracing as native ones. |
-| **Context that holds** | Token budgeting, tool-result truncation, sliding window, LLM compaction with a persistent summary, Anthropic prompt caching. |
+| **Memory only when you ask** | Stateless by default. `MemoryConfig()` keeps the conversation; `MemoryConfig(store="app.db")` adds SQLite long-term memory — facts, resumable sessions and automatic summaries — with no database code. |
+| **Context that holds** | Deterministic, cache-aware trimming with no LLM call, tool results capped as they arrive, server-side clearing on Anthropic, reasoning kept valid on models that bind it, a `context_filter` hook, and `dry_run` to see exactly what is sent. |
 | **Traces, not log lines** | A span tree with automatic secret redaction: `where_it_failed()`, `tool_stats()`, `cost_summary()`, and JSON / JSONL / SQLite / OTel export. |
 | **Real cost tracking** | Per-model pricing including cache-read and cache-write tiers, wired straight into the budget guard. |
 | **Safe by construction** | Arguments validated against the schema before your function runs. Per-tool timeouts, retries only for `idempotent` tools, and the `tool_use ↔ tool_result` invariant preserved even on cancellation. |
@@ -118,11 +119,11 @@ migrations into projects.
 | **Runaway protection** | Mostly your problem | Four independent termination layers |
 | **Provider switching** | Integration package per provider | One string — the model id names its provider |
 | **Dependency weight** | Large transitive tree | 5 runtime deps: `anthropic`, `openai`, `rich`, `jsonschema`, `pydantic` |
-| **Reading the source** | Large, layered, DSL-heavy | ~8,000 lines of plain Python. No DSL, no pipe operator, no magic |
+| **Reading the source** | Large, layered, DSL-heavy | ~11,000 lines of plain Python. No DSL, no pipe operator, no magic |
 
 **And it is yours to change.** This is MIT-licensed and small enough to actually read in
 an afternoon. Clone it, add the provider your client insists on, swap the permission
-engine for your company's policy service, replace the compaction strategy, teach the
+engine for your company's policy service, replace the trimming strategy, teach the
 cost tracker your negotiated rates. There is no plugin API to learn and no abstraction
 to fight — the extension point is the source code, and it is written to be read. When
 your requirements stop matching the framework's assumptions, you edit the framework
@@ -148,7 +149,7 @@ provider declares (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`), or passed explicitly
 `Agent(..., api_key=...)`.
 
 ```bash
-pytest agent_framework/tests/ -q      # 463 tests, fully offline against mocked providers
+pytest agent_framework/tests/ -q      # 626 tests, fully offline against mocked providers
 ```
 
 No key is required to run the test suite.
@@ -186,12 +187,12 @@ settings you actually reach for; everything else lives on `AgentConfig`, which i
 frozen, validated at construction, and serializable:
 
 ```python
-from agent_framework import Agent, AgentConfig, CompactionConfig
+from agent_framework import Agent, AgentConfig
 
 config = AgentConfig(
     model="claude-opus-5",
     system_prompt="You are a helpful assistant.",
-    compaction=CompactionConfig(trigger_ratio=0.85),
+    max_context_tokens=60_000,           # trim the prompt when it reaches this size
     request_extra={"thinking": {"type": "adaptive"}},
 )
 
@@ -214,7 +215,8 @@ agent = Agent(AgentConfig.from_env())            # or from_env(prefix="MYAPP_")
 
 `run()` never raises for operational failures. A budget stop, a turn-limit stop, or a
 provider error comes back as `result.stop_reason == StopReason.ERROR` with the exception
-on `result.error`. Only `asyncio.CancelledError` propagates.
+on `result.error`; a prompt that would not fit the context window is stopped *before* it
+is sent, as `StopReason.CONTEXT_EXCEEDED`. Only `asyncio.CancelledError` propagates.
 
 ---
 
@@ -330,19 +332,21 @@ runtime accepts any token and the vendor's key would be the wrong one anyway; an
 works unchanged.
 
 Everything above the adapter is untouched by the switch: the tool loop, permissions,
-`ask_user`, MCP servers, context compaction, checkpoints and the trace all behave exactly
-as they do against a vendor API.
+`ask_user`, MCP servers, memory, context trimming, checkpoints and the trace all behave
+exactly as they do against a vendor API.
 
 **Three things differ, and the framework tells you about two of them.**
 
 *Set `context_window` yourself.* The catalog knows the windows of models it ships with;
 yours it cannot. Left unset, the model inherits the provider's 200k fallback — and a model
-actually served with an 8k window would then never trigger compaction and simply overflow
+actually served with an 8k window would then never trigger a trim and simply overflow
 at the endpoint. Constructing an uncatalogued model without a window warns, naming the fix.
 
-*Small windows need smaller buffers.* The defaults reserve 8192 tokens for the response
-and 4096 to run compaction, which does not fit an 8k window; construction fails with that
-arithmetic spelled out. Tighten them together:
+*The response shares the window.* The prompt may use what `max_tokens_per_response`
+(4096 by default) leaves, and the automatic limits follow from that: on an 8k window the
+prompt is trimmed at 4096 tokens and one tool result is capped at 819. A window no larger
+than the response share fails at construction, naming the setting to lower. To give the
+prompt more room, shrink the response share, and set the trim point yourself if you like:
 
 ```python
 from agent_framework import Agent, AgentConfig
@@ -351,8 +355,8 @@ agent = Agent(AgentConfig(
     model="openai:qwen2.5-7b-instruct",
     base_url="http://localhost:8000/v1",
     context_window=8192,
-    response_buffer_tokens=1024,
-    compaction_buffer_tokens=512,
+    max_tokens_per_response=1024,
+    max_context_tokens=6_000,     # must stay within 8192 - 1024
 ))
 ```
 
@@ -397,8 +401,8 @@ Span types: `session`, `run`, `turn`, `llm_call`, `tool_call`, `tool_result`,
 
 The trace explains its own behaviour, because settings are recorded alongside the spans
 they caused. `session` carries the config the agent was built with — the *resolved*
-context window, the compaction thresholds, the sampling parameters, and whether the
-model was priced at all (an unpriced model records `$0.00` and silently disables
+context window and context limits, the memory settings and session id, the sampling
+parameters, and whether the model was priced at all (an unpriced model records `$0.00` and silently disables
 `max_budget_usd`, which is otherwise indistinguishable from a genuinely cheap run).
 `run` carries the effective policy of one run, since `run(max_turns=3)` overrides the
 config per call: without it, a trace cannot separate "the caller capped this run" from
@@ -452,14 +456,75 @@ Chunk types: `text_delta`, `tool_use_start`, `tool_use_delta`, `tool_use_complet
 `reasoning_delta`, `usage`, `stop`, `error`. Tools execute mid-stream under the same
 permission engine as `run()`.
 
-### Memory and checkpoints
+### Memory and context
 
-Short-term memory is the working message buffer. Long-term memory is optional, backed by
-SQLite or in-memory, and surfaces matching facts into a `<relevant_context>` block during
-context assembly.
+An agent is **stateless by default**: every `run()`, `run_stream()` and `complete()`
+starts from an empty history, so unrelated calls never leak into each other and nothing
+costs memory you did not ask for. Memory is one setting, in three levels:
 
 ```python
-cid = agent.checkpoint()          # full fidelity: tool calls, results, reasoning, cost
+from agent_framework import Agent, MemoryConfig
+
+Agent("claude-opus-5")                                   # stateless
+Agent("claude-opus-5", memory=MemoryConfig())            # the conversation, in RAM
+Agent(                                                   # + long-term memory in SQLite
+    "claude-opus-5",
+    memory=MemoryConfig(store="support.db", namespace="customer-42"),
+    session_id="ticket-4412",
+)
+```
+
+With a `store`, facts you `await agent.memory.remember(key, value)` are matched (whole
+words, any script) against each new message and stored in that run's history; every run
+saves the conversation, and an agent with the same `session_id` resumes it — in another
+process, after a restart. Turns a trim removes are summarized into the namespace's
+long-term summary (one LLM call each), and every new conversation starts with that
+summary; a short conversation that never trimmed is summarized once it has been idle for
+30 minutes, or on demand with `await agent.memory.summarize()`. Close the store with
+`await agent.memory.close()`.
+
+| Where | Setting | Default | Meaning |
+|---|---|---|---|
+| `AgentConfig` | `max_context_tokens` | min(70 % of the window, 150k) | the prompt is trimmed when it reaches this size |
+| `AgentConfig` | `max_tool_result_tokens` | min(16k, 10 % of the window) | a bigger tool result is cut (head + tail) when it arrives |
+| `AgentConfig` / `Agent(...)` | `memory` | `None` = stateless | turn memory on with a `MemoryConfig` |
+| `MemoryConfig` | `store` | `None` = RAM only | a SQLite file → long-term memory |
+| `MemoryConfig` | `namespace` | `"default"` | whose memory: a user, a customer, a project |
+| `MemoryConfig` | `summarize` | `True` | summarize what trims remove and idle sessions left |
+| `MemoryConfig` | `summary_model` | the agent's model | a cheaper model of the same provider for summaries |
+| `Agent(...)` | `session_id` | a fresh id per agent | which conversation to save and resume |
+| `Agent(...)` | `context_filter` | `None` | your function to change what is sent (advanced) |
+| `Agent(...)` | `memory_backend` | `None` | a custom long-term backend instead of SQLite (advanced) |
+| `@tool(...)` | `max_result_tokens` | the agent's default | the cap for this tool |
+| `@tool(...)` | `clear_old_results` | `True` | `False` = this tool's results are never cleared |
+| `agent.run(...)` | `dry_run` | `False` | show what would be sent, without calling the model |
+
+**How the context is kept in bounds.** Stored messages are never edited: what the model
+sees is rendered from them, and a trim only removes whole old turns from the start of the
+history (with a `store`, the session log keeps them). Nothing already sent changes
+between trims, so the provider's prompt cache keeps hitting. When the prompt (system + tools + messages)
+outgrows `max_context_tokens`, one trim takes it down to 60 % of the limit, with no LLM
+call: old tool results become a one-line note (the newest stay, as do errors, small
+results and tools with `clear_old_results=False`), then whole old turns go — the first
+user message is pinned, the newest three turns always stay. On models that bind
+reasoning to the conversation prefix (Claude Fable 5.1, Opus 5.5, Sonnet 5.5) a trim
+happens only at the start of a run; inside a long run, Anthropic's server-side
+tool-result clearing takes over (automatic against the vendor API), and a prompt that
+still cannot fit is stopped before it is sent.
+
+**See what is sent.** `result.context` reports the last call: messages sent and stored,
+the token estimate, cleared results, dropped reasoning and the cache-hit ratio — the same
+numbers every `llm_call` span carries. `await agent.run(prompt, dry_run=True)` returns the
+view the next call would send, without calling the model or changing anything.
+
+**Shape it yourself.** `context_filter(messages, info) -> messages` (sync or async) runs
+before every call and changes only what is sent. Its output is repaired into a valid
+conversation; on models that bind reasoning to the prefix, an edit of what was already
+sent mid-run is rejected and traced. A rule such as "remember only the last N exchanges"
+belongs here.
+
+```python
+cid = agent.checkpoint()          # full fidelity: messages, context state, cost
 await agent.run("try something risky")
 agent.restore(cid)                # exact rollback
 ```
@@ -472,11 +537,13 @@ agent.restore(cid)                # exact rollback
 # construction — a model id or an AgentConfig, plus overrides
 agent = Agent("claude-opus-5", system_prompt=..., max_turns=..., max_budget_usd=...,
               temperature=..., api_key=..., base_url=..., context_window=...,
-              tools=[...], permissions=..., memory=..., trace=..., pricing=...)
+              memory=MemoryConfig(...), tools=[...], permissions=..., session_id=...,
+              context_filter=..., memory_backend=..., trace=..., pricing=...)
 agent = await Agent.connect(config, mcp=registry, tools=[...])   # discover MCP eagerly
 
 # four verbs — all async
-result = await agent.run(prompt, max_turns=..., max_tool_rounds=..., tool_choice=...)
+result = await agent.run(prompt, max_turns=..., max_tool_rounds=..., tool_choice=...,
+                         dry_run=False)
 result = await agent.complete(prompt)                  # one call; tools advertised, NOT executed
 async for chunk in agent.run_stream(prompt): ...
 obj    = await agent.to_json(prompt, schema=PydanticModel)   # or a jsonschema dict
@@ -487,10 +554,13 @@ result.stop_reason     # StopReason
 result.state.turn      # int
 result.tool_calls      # list[ToolCallRequest] — mainly for complete()
 result.error           # Exception | None
+result.context         # ContextReport — what the last call was sent
 
-# inspection
-agent.get_history() · agent.clear_history() · agent.get_trace()
-agent.tools · agent.memory · agent.permissions · agent.cost
+# inspection and memory
+agent.get_history() · await agent.clear_history() · agent.get_trace()
+agent.tools · agent.memory · agent.permissions · agent.cost · agent.session_id
+await agent.memory.remember(key, value) · await agent.memory.summarize()
+await agent.memory.close()
 agent.checkpoint() · agent.restore(cid)
 ```
 
@@ -506,7 +576,7 @@ flowchart TD
     U[Your code] --> A[Agent]
     A --> L[AgentLoop]
 
-    L --> CM[ContextManager<br/>compaction · caching · token budget]
+    L --> CM[ContextManager<br/>trimming · caching · token budget]
     L --> P[PermissionResolver<br/>deny-first waterfall]
     L --> E[ToolExecutor<br/>validate · timeout · retry]
     L --> AD[Provider adapter]
@@ -550,7 +620,7 @@ nothing else in the framework to touch.
 
 ## Project status
 
-`0.1.0` — the core is stable and covered by **463 tests** that run fully offline, including
+`0.1.0` — the core is stable and covered by **626 tests** that run fully offline, including
 golden-request tests that pin both providers' wire formats. CI runs lint and the full
 suite on Python 3.11 and 3.12.
 
