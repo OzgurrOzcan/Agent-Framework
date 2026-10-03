@@ -81,7 +81,7 @@ def test_an_agent_builds_against_a_local_endpoint_without_any_key():
 # ---------------- context window ----------------
 
 def test_an_unknown_model_warns_that_its_window_was_guessed():
-    """A 8k model budgeted as 200k never compacts and overflows at the server."""
+    """A 8k model budgeted as 200k never trims and overflows at the server."""
     with pytest.warns(UserWarning, match="Unknown context window"):
         AgentConfig(model=LOCAL_MODEL, base_url="http://127.0.0.1:1/v1")
 
@@ -107,17 +107,20 @@ def test_context_window_is_settable_from_the_flat_surface():
     assert agent.config.resolved_context_window == LOCAL_WINDOW
 
 
-def test_a_small_window_rejects_the_default_buffers():
-    """8k models need smaller buffers; the error says exactly that."""
-    with pytest.raises(ValueError, match="less than the context window"):
-        local_config(context_window=8192)
+def test_a_small_window_gets_limits_that_fit():
+    """The automatic limits leave room for the response on an 8k model."""
+    config = local_config(context_window=8192)
+    # 70 % of 8192 would exceed what the 4096-token response leaves.
+    assert config.resolved_max_context_tokens == 8192 - 4096
+    assert config.resolved_max_tool_result_tokens == 819
 
 
-def test_a_small_window_works_once_the_buffers_fit():
-    config = local_config(
-        context_window=8192, response_buffer_tokens=1024, compaction_buffer_tokens=512
-    )
-    assert config.resolved_context_window == 8192
+def test_a_window_smaller_than_the_response_is_rejected():
+    """The error names the setting to lower."""
+    with pytest.raises(ValueError, match="Lower max_tokens_per_response"):
+        local_config(context_window=4096)
+    config = local_config(context_window=4096, max_tokens_per_response=1024)
+    assert config.resolved_max_context_tokens == 2867
 
 
 # ---------------- end to end against a real local server ----------------

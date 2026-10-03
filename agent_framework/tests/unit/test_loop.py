@@ -4,7 +4,6 @@ from agent_framework.core.config import AgentConfig
 from agent_framework.core.loop import AgentLoop
 from agent_framework.core.policy import LoopPolicy
 from agent_framework.core.context_manager import ContextManager
-from agent_framework.core.config import CompactionConfig
 from agent_framework.memory.short_term import ShortTermMemory
 from agent_framework.permissions.config import PermissionConfig
 from agent_framework.permissions.models import PermissionCategory
@@ -30,10 +29,8 @@ def _make_loop(mock: MockLLMProvider, tools: list | None = None) -> AgentLoop:
     mem = ShortTermMemory()
     ctx = ContextManager(
         system_prompt="You are a test agent.",
-        context_window=10000,
-        response_buffer_tokens=512,
-        compaction_buffer_tokens=256,
-        compaction=CompactionConfig(enabled=False),
+        max_context_tokens=100_000,
+        max_tool_result_tokens=10_000,
     )
     resolver = PermissionResolver(PermissionConfig(), trace=trace)
     executor = ToolExecutor(trace=trace)

@@ -1,6 +1,6 @@
 """Extended loop tests: provider errors, new stop reasons, streaming
 reasoning round-trip, cancellation invariant, tool_choice, budget guard,
-concurrency guard, persistent compaction integration."""
+concurrency guard."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import asyncio
 
 import pytest
 
-from agent_framework.core.config import AgentConfig, CompactionConfig
+from agent_framework.core.config import AgentConfig
 from agent_framework.core.context_manager import ContextManager
 from agent_framework.core.loop import AgentLoop
 from agent_framework.core.message import (
@@ -53,10 +53,8 @@ def make_loop(
     )
     ctx = context_manager or ContextManager(
         system_prompt="You are a test agent.",
-        context_window=10000,
-        response_buffer_tokens=512,
-        compaction_buffer_tokens=256,
-        compaction=CompactionConfig(enabled=False),
+        max_context_tokens=100_000,
+        max_tool_result_tokens=10_000,
     )
     return AgentLoop(
         config=config,
@@ -287,39 +285,3 @@ async def test_max_parallel_tools_respected():
     result = await loop.run("go", policy=LoopPolicy.full())
     assert result.final_message == "done"
     assert peak <= 2
-
-
-# ---------------- persistent compaction integration (T1.3) ----------------
-
-async def test_loop_persists_compaction_summary():
-    summarizer = MockLLMProvider([ScriptedTurn(text="COMPACT-SUMMARY")])
-    ctx = ContextManager(
-        system_prompt="sys",
-        context_window=800,          # tiny window to force compaction
-        response_buffer_tokens=50,
-        compaction_buffer_tokens=50,
-        compaction=CompactionConfig(
-            enabled=True, trigger_ratio=0.3, tool_result_truncate_threshold=100_000,
-            sliding_window_min_turns=50, full_compaction_min_recent_turns=1,
-            summary_max_tokens=50,
-        ),
-        summarizer=summarizer,
-        summarizer_model="mock-model",
-    )
-    mock = MockLLMProvider([ScriptedTurn(text="ok")])
-    loop = make_loop(mock, context_manager=ctx)
-    # Pre-fill history with bulky turns so assembly triggers summarization.
-    for i in range(6):
-        loop.short_term.append(UserMessage(content=f"question {i} " + "x" * 400))
-        loop.short_term.append(AssistantMessage(content=f"answer {i} " + "y" * 400))
-
-    before = len(loop.short_term)
-    await loop.run("final question", policy=LoopPolicy.full())
-    after = loop.short_term.snapshot()
-    assert len(after) < before, "compaction result must be persisted"
-    assert any(
-        isinstance(m, UserMessage) and "COMPACT-SUMMARY" in str(m.content)
-        for m in after
-    ), "persisted history must contain the summary message"
-    # (The single-summary-call guarantee is covered in
-    # test_context_manager_v2.test_summary_computed_once_then_persisted.)

@@ -13,7 +13,7 @@ argument at all:
     agent = Agent("claude-opus-5", system_prompt="...", tools=[my_tool])
 """
 
-from agent_framework.core.config import AgentConfig, CompactionConfig, TransportConfig
+from agent_framework.core.config import AgentConfig, TransportConfig
 from agent_framework.core.message import (
     Message,
     UserMessage,
@@ -61,7 +61,6 @@ from agent_framework.tracing.cost import CostTracker, PricingTable
 __all__ = [
     "Agent",
     "AgentConfig",
-    "CompactionConfig",
     "TransportConfig",
     "ProviderSpec",
     "ProviderResolutionError",

@@ -16,7 +16,7 @@ import json
 import pytest
 
 from agent_framework.core.agent import Agent
-from agent_framework.core.config import AgentConfig, CompactionConfig
+from agent_framework.core.config import AgentConfig
 from agent_framework.core.message import StopReason
 from agent_framework.permissions.models import PermissionCategory
 from agent_framework.providers.base import ToolChoice
@@ -70,7 +70,7 @@ def test_the_session_span_carries_the_settings_that_explain_a_run():
             max_turns=4,
             max_budget_usd=0.25,
             temperature=0.3,
-            compaction=CompactionConfig(trigger_ratio=0.85),
+            max_context_tokens=60_000,
         ),
         tools=[search],
     )
@@ -80,13 +80,17 @@ def test_the_session_span_carries_the_settings_that_explain_a_run():
     assert payload["max_turns"] == 4
     assert payload["max_budget_usd"] == 0.25
     assert payload["temperature"] == 0.3
-    assert payload["compaction"]["trigger_ratio"] == 0.85
+    assert payload["max_context_tokens"] == 60_000
+    assert payload["resolved_max_context_tokens"] == 60_000
+    # Left automatic, so recorded as None — not "[REDACTED]" for its key.
+    assert payload["max_tool_result_tokens"] is None
+    assert payload["resolved_max_tool_result_tokens"] == 12_000
     assert payload["tools"] == ["ask_user", "search"]
     assert payload["framework_version"]
 
 
 def test_the_session_span_records_the_resolved_context_window():
-    """A compaction span alone cannot say whether the window was defaulted."""
+    """A trim event alone cannot say whether the window was defaulted."""
     explicit = make_agent(
         config=AgentConfig(
             model="claude-opus-5", api_key="k", context_window=32_000

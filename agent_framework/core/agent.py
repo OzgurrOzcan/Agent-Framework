@@ -46,6 +46,7 @@ from agent_framework.interrupts.manager import InterruptManager
 from agent_framework.interrupts.renderers.base import UIRenderer
 from agent_framework.mcp.registry import MCPServerRegistry
 from agent_framework.memory.manager import MemoryManager
+from agent_framework.memory.short_term import ContextState
 from agent_framework.permissions.config import PermissionConfig
 from agent_framework.permissions.resolver import PermissionResolver
 from agent_framework.providers.base import BaseProviderAdapter, StreamChunk, ToolChoice
@@ -84,7 +85,7 @@ _CONFIG_OVERRIDES = (
     "api_key",
     "base_url",
     # Pairs with base_url: a self-hosted endpoint's window is not in the
-    # catalog, and getting it wrong means compaction never fires.
+    # catalog, and getting it wrong means trimming never fires.
     "context_window",
 )
 
@@ -211,20 +212,18 @@ class Agent:
             interrupt_manager=self._interrupts,
             session_id=self._trace.session_id,
             max_parallel=self.config.max_parallel_tools,
+            default_max_result_tokens=self.config.resolved_max_tool_result_tokens,
         )
         # Built once: the prompt must stay byte-stable for prompt caching, and
         # the session span fingerprints exactly this text.
         self._system_prompt = self._build_system_prompt()
         self._context_manager = ContextManager(
             system_prompt=self._system_prompt,
-            context_window=self.config.resolved_context_window,
-            response_buffer_tokens=self.config.response_buffer_tokens,
-            compaction_buffer_tokens=self.config.compaction_buffer_tokens,
-            compaction=self.config.compaction,
+            max_context_tokens=self.config.resolved_max_context_tokens,
+            max_tool_result_tokens=self.config.resolved_max_tool_result_tokens,
+            tools=registry,
             memory=self._memory,
             trace=self._trace,
-            summarizer=self._provider,
-            summarizer_model=self.config.model,
         )
         self._checkpoints: dict[CheckpointId, dict[str, Any]] = {}
 
@@ -414,20 +413,25 @@ class Agent:
     # ===================== checkpointing =====================
     def checkpoint(self) -> CheckpointId:
         cid = f"ckpt_{uuid.uuid4().hex[:12]}"
+        short_term = self._memory.short_term
         self._checkpoints[cid] = {
-            "messages": [m.to_dict() for m in self._memory.short_term.snapshot()],
+            "messages": [m.to_dict() for m in short_term.snapshot()],
+            # Without it a restored history would be rendered as if never
+            # trimmed: cleared results back in full, cut reasoning back in.
+            "context_state": short_term.state.to_dict(),
             "cost": self._cost.total_cost_usd,
         }
         return cid
 
     def restore(self, checkpoint_id: CheckpointId) -> None:
-        """Full-fidelity restore: tool_calls, tool results, reasoning and
-        metadata all survive the round-trip (see `message_from_dict`)."""
+        """Full-fidelity restore: tool_calls, tool results, reasoning,
+        metadata and the context state all survive the round-trip."""
         ckpt = self._checkpoints.get(checkpoint_id)
         if ckpt is None:
             raise KeyError(f"Unknown checkpoint: {checkpoint_id}")
         self._memory.short_term.replace_all(
-            message_from_dict(raw) for raw in ckpt["messages"]
+            (message_from_dict(raw) for raw in ckpt["messages"]),
+            state=ContextState.from_dict(ckpt.get("context_state")),
         )
         self._cost.total_cost_usd = ckpt.get("cost", self._cost.total_cost_usd)
 

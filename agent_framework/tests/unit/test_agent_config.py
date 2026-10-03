@@ -10,7 +10,7 @@ import dataclasses
 
 import pytest
 
-from agent_framework.core.config import AgentConfig, CompactionConfig, TransportConfig
+from agent_framework.core.config import AgentConfig, TransportConfig
 from agent_framework.providers.catalog import (
     DEFAULT_CONTEXT_WINDOW,
     ProviderResolutionError,
@@ -184,8 +184,6 @@ def test_explicit_context_window_wins():
         ({"temperature": -0.1}, "temperature"),
         ({"temperature": 2.5}, "temperature"),
         ({"context_window": 512}, "context_window"),
-        ({"response_buffer_tokens": -1}, "response_buffer_tokens"),
-        ({"compaction_buffer_tokens": -1}, "compaction_buffer_tokens"),
         ({"max_parallel_tools": 0}, "max_parallel_tools"),
     ],
 )
@@ -197,17 +195,28 @@ def test_out_of_range_values_are_rejected(kwargs, message):
 @pytest.mark.parametrize(
     "kwargs,message",
     [
-        ({"trigger_ratio": 0.0}, "trigger_ratio"),
-        ({"trigger_ratio": 1.5}, "trigger_ratio"),
-        ({"sliding_window_min_turns": 0}, "sliding_window_min_turns"),
-        ({"full_compaction_min_recent_turns": 0}, "full_compaction_min_recent_turns"),
-        ({"summary_max_tokens": 0}, "summary_max_tokens"),
-        ({"tool_result_truncate_threshold": -1}, "tool_result_truncate_threshold"),
+        ({"max_context_tokens": 0}, "max_context_tokens must be a positive int"),
+        ({"max_context_tokens": -1}, "max_context_tokens must be a positive int"),
+        ({"max_context_tokens": 1.5}, "max_context_tokens must be a positive int"),
+        ({"max_context_tokens": True}, "max_context_tokens must be a positive int"),
+        ({"max_tool_result_tokens": 0}, "max_tool_result_tokens must be a positive int"),
+        # The prompt may use only what the response leaves of the window.
+        (
+            {"context_window": 8192, "max_context_tokens": 8000},
+            "must not exceed the usable window",
+        ),
+        # One result may not be bigger than the whole prompt budget.
+        (
+            {"max_context_tokens": 20_000, "max_tool_result_tokens": 20_001},
+            "must not exceed max_context_tokens",
+        ),
+        # No room left for any prompt at all.
+        ({"context_window": 4096, "max_tokens_per_response": 4096}, "Lower max_tokens_per_response"),
     ],
 )
-def test_compaction_values_are_validated(kwargs, message):
+def test_context_limits_are_validated(kwargs, message):
     with pytest.raises(ValueError, match=message):
-        CompactionConfig(**kwargs)
+        cfg(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -222,27 +231,18 @@ def test_transport_values_are_validated(kwargs, message):
         TransportConfig(**kwargs)
 
 
-def test_buffers_larger_than_the_window_are_rejected():
-    """ContextManager.budget() clamps to 1 token, compacting every turn."""
-    with pytest.raises(ValueError, match="less than the context window"):
-        cfg(
-            context_window=8192,
-            response_buffer_tokens=8192,
-            compaction_buffer_tokens=4096,
-        )
-
-
 def test_valid_edge_values_are_accepted():
     config = cfg(
         max_turns=1,
         temperature=0.0,
         max_budget_usd=0.0001,
         context_window=1024,
-        response_buffer_tokens=0,
-        compaction_buffer_tokens=0,
-        compaction=CompactionConfig(trigger_ratio=1.0),
+        max_tokens_per_response=1023,
+        max_context_tokens=1,
+        max_tool_result_tokens=1,
     )
     assert config.max_turns == 1
+    assert config.usable_context_tokens == 1
 
 
 # ---------------- api key resolution ----------------
@@ -283,14 +283,22 @@ def test_to_dict_round_trips():
         temperature=0.3,
         environment={"env": "prod"},
         request_extra={"thinking": {"type": "adaptive"}},
-        compaction=CompactionConfig(trigger_ratio=0.85),
+        max_context_tokens=50_000,
+        max_tool_result_tokens=4_000,
         transport=TransportConfig(timeout_seconds=12.0, max_retries=5),
     )
     restored = AgentConfig.from_dict(base.to_dict())
     # The API key is deliberately not serialized; everything else survives.
     assert restored == base.replace(api_key=None)
-    assert restored.compaction.trigger_ratio == 0.85
+    assert restored.max_context_tokens == 50_000
     assert restored.transport.max_retries == 5
+
+
+def test_automatic_limits_round_trip_as_automatic():
+    """`to_dict()` reports the resolved limits but must not freeze them."""
+    restored = AgentConfig.from_dict(cfg().to_dict())
+    assert restored.max_context_tokens is None
+    assert restored.max_tool_result_tokens is None
 
 
 def test_to_dict_never_leaks_the_api_key():
@@ -318,15 +326,34 @@ def test_to_dict_is_json_serializable_and_self_describing():
         "max_budget_usd",
         "temperature",
         "enable_prompt_caching",
-        "compaction",
+        "max_context_tokens",
+        "resolved_max_context_tokens",
+        "resolved_max_tool_result_tokens",
     ):
         assert key in data, key
     assert data["resolved_context_window"] == 1_000_000
+    assert data["resolved_max_context_tokens"] == 150_000
+    assert data["resolved_max_tool_result_tokens"] == 16_000
 
 
 def test_from_dict_rejects_unknown_keys():
     with pytest.raises(ValueError, match="max_turn"):
         AgentConfig.from_dict({"model": "claude-opus-5", "max_turn": 3})
+
+
+@pytest.mark.parametrize(
+    "field,hint",
+    [
+        ("response_buffer_tokens", "context_window - max_tokens_per_response"),
+        ("compaction_buffer_tokens", "no LLM call"),
+        ("compaction", "max_context_tokens and max_tool_result_tokens"),
+    ],
+)
+def test_removed_buffer_fields_are_rejected_by_from_dict(field, hint):
+    """A stale config file fails with the replacement, not a bare "unknown"."""
+    with pytest.raises(ValueError, match="Removed AgentConfig field") as exc:
+        AgentConfig.from_dict({"model": "claude-opus-5", field: 4096})
+    assert hint in str(exc.value)
 
 
 def test_from_dict_accepts_already_built_nested_records():
@@ -345,7 +372,10 @@ def test_from_env_reads_the_flat_fields(monkeypatch):
     monkeypatch.setenv("AGENT_TEMPERATURE", "0.2")
     monkeypatch.setenv("AGENT_ENABLE_PROMPT_CACHING", "false")
     monkeypatch.setenv("AGENT_SYSTEM_PROMPT", "from env")
+    monkeypatch.setenv("AGENT_MAX_CONTEXT_TOKENS", "50000")
+    monkeypatch.setenv("AGENT_MAX_TOOL_RESULT_TOKENS", "4000")
     config = AgentConfig.from_env()
+    assert (config.max_context_tokens, config.max_tool_result_tokens) == (50_000, 4_000)
     assert config.model == "claude-opus-5"
     assert config.max_turns == 3
     assert config.max_budget_usd == 1.5

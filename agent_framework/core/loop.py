@@ -247,13 +247,12 @@ class AgentLoop:
                     name=f"turn[{turn_num}]",
                     turn_number=turn_num,
                 ) as turn_span:
-                    # Context assembly (+ persist LLM-driven compaction).
+                    # Render what is sent; trims the history first when the
+                    # prompt has outgrown max_context_tokens.
                     assembled = await self.context.assemble(
-                        self.short_term.snapshot(),
+                        self.short_term,
                         current_user_input=user_input,
                     )
-                    if assembled.persist is not None:
-                        self.short_term.replace_all(assembled.persist)
 
                     # LLM call — nested under the turn span.
                     with self.trace.start_span(
@@ -302,7 +301,7 @@ class AgentLoop:
                             model=self.config.model,
                             stop_reason=response.stop_reason.value,
                             ctx_tokens=assembled.estimated_tokens,
-                            compaction=assembled.compaction_applied,
+                            trimmed=assembled.trim is not None and assembled.trim.applied,
                         )
 
                     # Layer 4: budget guard.
@@ -531,11 +530,9 @@ class AgentLoop:
                 turn_num = self.trace.bump_turn()
 
                 assembled = await self.context.assemble(
-                    self.short_term.snapshot(),
+                    self.short_term,
                     current_user_input=user_input,
                 )
-                if assembled.persist is not None:
-                    self.short_term.replace_all(assembled.persist)
 
                 tool_calls_this_turn: list[ToolCallRequest] = []
                 text_parts: list[str] = []
@@ -624,7 +621,12 @@ class AgentLoop:
                         )
                         return
 
-                    llm_span.update(stop_reason=stop_reason.value)
+                    llm_span.update(
+                        model=self.config.model,
+                        stop_reason=stop_reason.value,
+                        ctx_tokens=assembled.estimated_tokens,
+                        trimmed=assembled.trim is not None and assembled.trim.applied,
+                    )
 
                 # Layer 4: budget guard.
                 if (

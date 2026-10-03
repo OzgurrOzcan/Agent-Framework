@@ -1,34 +1,51 @@
-"""ContextManager — assemble + compact context before every LLM call.
+"""ContextManager — what the model sees on every call.
 
-Cache boundary discipline:
-  - The system prompt is byte-stable for the entire session (top of prefix,
-    cached on Anthropic).
-  - Everything dynamic (memory injection, reminders) is appended as
-    user-role messages at the END of the message list, after the incremental
-    cache breakpoint, so the stable conversation prefix stays cacheable.
+The history in `ShortTermMemory` is stored in full and only grows between
+trims. Before every LLM call the context manager renders the *view* — what is
+actually sent — from that history and its `ContextState`:
 
-Compaction strategies, cheapest-first:
-  1. Tool-result truncation       (free, recomputed per turn)
-  2. Sliding window               (free, recomputed per turn)
-  3. Selective summary            (1 LLM call: summarize oldest 30%)
-  4. Full compaction              (1 LLM call: summarize all but last K)
+    [pinned first message]?  history   (old tool results in the cleared zone
+                                        become a one-line note; reasoning
+                                        before the cut is left out)
 
-LLM-driven steps (3, 4) are expensive, so their result is *persisted*: the
-returned `AssembledContext.persist` list replaces short-term memory, meaning
-the summary is computed once, not on every subsequent turn.
+and estimates the prompt: system prompt + tool definitions + messages.
 
-Token estimates are calibrated against the provider's real usage numbers via
-`note_actual_tokens()` (EWMA), because the chars/4 heuristic drifts badly on
-non-English text and code.
+Trimming makes no LLM call and happens only when the estimate exceeds
+`max_context_tokens` — then deeply, down to 60 % of the limit — so the prompt
+cache is rebuilt once per trim instead of on every call:
+
+  1. Clear: all but the newest k tool results become a byte-stable note.
+     Errors, small results, `ask_user` and tools declared with
+     `clear_old_results=False` are never cleared.
+  2. Drop: if still above 60 %, whole oldest turns go; the conversation's
+     first user message is pinned and the newest three turns always stay.
+  3. Reasoning: if 1 or 2 changed anything, reasoning before the current turn
+     is left out — models that bind reasoning to the conversation prefix
+     reject it once that prefix changed, and the rest ignore old reasoning.
+
+Afterwards the view only grows again. A trim that cannot get usefully below
+the limit (a huge current turn or pinned message) changes nothing, and is
+recorded once rather than on every call.
+
+Token estimates are anchored on the prompt size the provider reported for the
+previous call, plus a calibrated chars/4 estimate of what was appended since.
+The anchor is dropped whenever the history is trimmed or replaced. The
+calibration factor is an EWMA of actual/estimated, because chars/4 drifts
+badly on non-English text and code.
+
+Cache discipline: the system prompt is byte-stable and first; the view only
+grows between trims; dynamic per-call context (memory facts) is appended after
+the history, past the incremental cache breakpoint.
 """
 
 from __future__ import annotations
 
+import bisect
+import dataclasses
 import json
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from agent_framework.core.config import CompactionConfig
 from agent_framework.core.message import (
     AnyMessage,
     AssistantMessage,
@@ -38,14 +55,74 @@ from agent_framework.core.message import (
     estimate_message_tokens,
     estimate_tokens,
 )
-from agent_framework.tracing.trace import (
-    EventType,
-    ExecutionTrace,
-)
+from agent_framework.memory.short_term import ContextState, ShortTermMemory
+from agent_framework.tools.builtin.ask_user import ASK_USER_TOOL_NAME
+from agent_framework.tracing.trace import EventType, ExecutionTrace
 
 if TYPE_CHECKING:
     from agent_framework.memory.manager import MemoryManager
-    from agent_framework.providers.base import BaseProviderAdapter
+    from agent_framework.tools.registry import ToolRegistry
+
+
+# What a cleared tool result is replaced with. Derived only from the result
+# itself, so the note is byte-identical on every call (prompt cache) and the
+# tool_use / tool_result pair stays intact.
+CLEAR_NOTE = (
+    "[cleared to save context: {name} returned ≈{tokens} tokens. "
+    "Call the tool again if you need it.]"
+)
+
+# A trim aims this far below the limit, so the view can grow for a while
+# before the next one: one cache rebuild per trim, not one per call.
+TRIM_TARGET_SHARE = 0.60
+# The newest tool results that stay complete (fewer on small windows).
+KEEP_RECENT_RESULTS = 5
+# The newest turns that are never dropped; the current turn is one of them.
+KEEP_RECENT_TURNS = 3
+# Results this small are never cleared: the note would save next to nothing.
+PROTECTED_RESULT_TOKENS = 64
+# A trim that cannot reach the target is applied only if it leaves at least
+# this share of the limit free; a smaller gain would trigger the next trim —
+# and the next cache rebuild — almost immediately.
+MIN_TRIM_HEADROOM = 0.10
+
+_CALIBRATION_BOUNDS = (0.5, 4.0)
+
+
+@dataclass(frozen=True)
+class TrimOutcome:
+    """What one trim did (or why it did nothing), for traces and reports."""
+
+    applied: bool
+    estimated_before: int
+    estimated_after: int
+    limit: int
+    target: int
+    cleared_results: int = 0
+    dropped_messages: int = 0
+    dropped_turns: int = 0
+    pinned: bool = False
+    reasoning_cut: bool = False
+
+    @property
+    def reached_target(self) -> bool:
+        return self.estimated_after <= self.target
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "applied": self.applied,
+            "estimated_before": self.estimated_before,
+            "estimated_after": self.estimated_after,
+            "reclaimed_tokens": self.estimated_before - self.estimated_after,
+            "limit": self.limit,
+            "target": self.target,
+            "reached_target": self.reached_target,
+            "cleared_results": self.cleared_results,
+            "dropped_messages": self.dropped_messages,
+            "dropped_turns": self.dropped_turns,
+            "pinned_first_message": self.pinned,
+            "reasoning_cut": self.reasoning_cut,
+        }
 
 
 @dataclass
@@ -53,10 +130,29 @@ class AssembledContext:
     system_prompt: str
     messages: list[AnyMessage]
     estimated_tokens: int
-    compaction_applied: list[str]
-    # When set, the caller must replace short-term memory with this list —
-    # it contains the persisted result of an LLM-driven compaction step.
-    persist: list[AnyMessage] | None = None
+    # Set when this call's estimate exceeded the limit.
+    trim: TrimOutcome | None = None
+
+
+@dataclass(frozen=True)
+class _Anchor:
+    """The provider-reported size of the previous call's prompt."""
+
+    epoch: int
+    view_len: int  # history-view messages that call covered
+    tokens: int  # reported prompt size minus that call's dynamic preamble
+    tools_raw: int  # raw tool-definition estimate at that call
+
+
+@dataclass(frozen=True)
+class _PendingCall:
+    """What the call about to be made was built from, for `note_actual_tokens`."""
+
+    epoch: int
+    view_len: int
+    raw_total: int
+    preamble_tokens: int
+    tools_raw: int
 
 
 class ContextManager:
@@ -64,28 +160,30 @@ class ContextManager:
         self,
         *,
         system_prompt: str,
-        context_window: int,
-        response_buffer_tokens: int,
-        compaction_buffer_tokens: int,
-        compaction: CompactionConfig,
-        memory: "MemoryManager | None" = None,
+        max_context_tokens: int,
+        max_tool_result_tokens: int,
+        tools: ToolRegistry | None = None,
+        memory: MemoryManager | None = None,
         trace: ExecutionTrace | None = None,
-        summarizer: "BaseProviderAdapter | None" = None,
-        summarizer_model: str = "",
     ) -> None:
+        if max_context_tokens < 1 or max_tool_result_tokens < 1:
+            raise ValueError("max_context_tokens and max_tool_result_tokens must be >= 1")
         self._system_prompt = system_prompt
-        self._context_window = context_window
-        self._response_buffer = response_buffer_tokens
-        self._compaction_buffer = compaction_buffer_tokens
-        self._cfg = compaction
+        self._system_raw = estimate_tokens(system_prompt)
+        self._limit = max_context_tokens
+        self._result_cap = max_tool_result_tokens
+        self._tools = tools
         self._memory = memory
         self._trace = trace
-        self._summarizer = summarizer
-        self._summarizer_model = summarizer_model
         # EWMA correction factor: actual_tokens / estimated_tokens.
         self._calibration = 1.0
-        self._last_estimate_total = 0
+        self._anchor: _Anchor | None = None
+        self._pending: _PendingCall | None = None
+        # Epoch at which an unsatisfiable trim was last recorded.
+        self._noop_epoch: int | None = None
+        self._tools_raw_cache: tuple[tuple[str, ...], int] | None = None
 
+    # ------------------------------------------------------------ properties
     @property
     def system_prompt(self) -> str:
         return self._system_prompt
@@ -94,336 +192,358 @@ class ContextManager:
     def calibration(self) -> float:
         return self._calibration
 
-    def budget(self) -> int:
-        """Total tokens available for conversation messages."""
-        sys_tokens = estimate_tokens(self._system_prompt)
-        return max(
-            1,
-            self._context_window - sys_tokens - self._response_buffer - self._compaction_buffer,
-        )
+    @property
+    def max_context_tokens(self) -> int:
+        return self._limit
+
+    @property
+    def trim_target(self) -> int:
+        return int(self._limit * TRIM_TARGET_SHARE)
+
+    def keep_recent_results(self) -> int:
+        """How many of the newest clearable results a trim keeps complete.
+
+        Five, unless five results at the cap would take more than half of the
+        trim target — then fewer (never less than one), so that a small
+        window can still reach the target.
+        """
+        fit = (self.trim_target // 2) // self._result_cap
+        return max(1, min(KEEP_RECENT_RESULTS, fit))
+
+    # ------------------------------------------------------------- the view
+    def render_view(self, history: list[AnyMessage], state: ContextState) -> list[AnyMessage]:
+        """What the model sees for *history* under *state*. Pure; never mutates."""
+        view: list[AnyMessage] = [state.pinned] if state.pinned is not None else []
+        view.extend(self._render_history(history, state))
+        return view
+
+    def _render_history(
+        self, history: list[AnyMessage], state: ContextState
+    ) -> list[AnyMessage]:
+        out: list[AnyMessage] = []
+        ordinal = 0  # tool results seen so far, in history order
+        for index, message in enumerate(history):
+            if isinstance(message, ToolResultMessage):
+                rendered: list[ToolResult] = []
+                changed = False
+                for result in message.content:
+                    if ordinal < state.cleared_results and self._clearable(result):
+                        rendered.append(_cleared(result))
+                        changed = True
+                    else:
+                        rendered.append(result)
+                    ordinal += 1
+                out.append(dataclasses.replace(message, content=rendered) if changed else message)
+            elif (
+                isinstance(message, AssistantMessage)
+                and index < state.reasoning_cut
+                and message.reasoning
+            ):
+                out.append(dataclasses.replace(message, reasoning=[]))
+            else:
+                out.append(message)
+        return out
+
+    def _clearable(self, result: ToolResult) -> bool:
+        if result.is_error or result.name == ASK_USER_TOOL_NAME:
+            return False
+        if estimate_tokens(result.as_text()) <= PROTECTED_RESULT_TOKENS:
+            return False
+        tool = self._tools.get(result.name) if self._tools is not None else None
+        return tool is None or tool.metadata.clear_old_results
+
+    # ------------------------------------------------------------ estimates
+    def _tools_raw(self) -> int:
+        """Raw token estimate of the tool definitions sent with every call."""
+        if self._tools is None:
+            return 0
+        names = tuple(self._tools.names)
+        if self._tools_raw_cache is not None and self._tools_raw_cache[0] == names:
+            return self._tools_raw_cache[1]
+        total = 0
+        for t in self._tools:
+            meta = t.metadata
+            spec = {
+                "name": meta.name,
+                "description": meta.description,
+                "input_schema": meta.parameters_schema,
+            }
+            total += 8 + estimate_tokens(json.dumps(spec, default=str))
+        self._tools_raw_cache = (names, total)
+        return total
+
+    def _calibrated(self, raw: int) -> int:
+        return int(raw * self._calibration)
+
+    def estimate(
+        self,
+        memory: ShortTermMemory,
+        view: list[AnyMessage],
+        preamble: list[AnyMessage] | None = None,
+    ) -> int:
+        """Estimated prompt size for sending *view* (+ *preamble*).
+
+        Anchored on the previous call's reported size when the history has
+        only grown since; otherwise the calibrated estimate of everything.
+        """
+        preamble_raw = _raw(preamble or [])
+        tools_raw = self._tools_raw()
+        anchor = self._anchor
+        if anchor is not None and anchor.epoch == memory.epoch and anchor.view_len <= len(view):
+            appended = _raw(view[anchor.view_len :])
+            return anchor.tokens + self._calibrated(
+                appended + preamble_raw + tools_raw - anchor.tools_raw
+            )
+        return self._calibrated(self._system_raw + tools_raw + _raw(view) + preamble_raw)
 
     def note_actual_tokens(self, actual_input_tokens: int) -> None:
-        """Calibrate the estimator with the provider-reported context size.
+        """Calibrate against the provider-reported size of the call just made.
 
-        Pass the *full* context size (input + cache_read + cache_creation
-        tokens). Called by the loop after every LLM response.
+        Pass the *full* prompt size (input + cache_read + cache_creation
+        tokens). Called by the loop after every LLM response; it also anchors
+        the next call's estimate.
         """
-        if actual_input_tokens <= 0 or self._last_estimate_total <= 0:
+        pending = self._pending
+        if actual_input_tokens <= 0 or pending is None:
             return
-        ratio = actual_input_tokens / self._last_estimate_total
-        self._calibration = min(4.0, max(0.5, 0.8 * self._calibration + 0.2 * ratio))
+        if pending.raw_total > 0:
+            ratio = actual_input_tokens / pending.raw_total
+            low, high = _CALIBRATION_BOUNDS
+            self._calibration = min(high, max(low, 0.8 * self._calibration + 0.2 * ratio))
+        self._anchor = _Anchor(
+            epoch=pending.epoch,
+            view_len=pending.view_len,
+            tokens=max(0, actual_input_tokens - pending.preamble_tokens),
+            tools_raw=pending.tools_raw,
+        )
 
-    def _calibrated(self, raw_tokens: int) -> int:
-        return int(raw_tokens * self._calibration)
-
+    # ------------------------------------------------------------- assembly
     async def assemble(
         self,
-        history: list[AnyMessage],
+        memory: ShortTermMemory,
         *,
         current_user_input: str | None = None,
+        allow_trim: bool = True,
     ) -> AssembledContext:
-        applied: list[str] = []
-        working: list[AnyMessage] = list(history)
-        summary_msgs: list[AnyMessage] = []
-        persist_needed = False
+        """Render the view for the next call, trimming *memory* first if needed.
 
-        budget = self.budget()
-        current = sum(estimate_message_tokens(m) for m in working)
+        A trim mutates *memory* (pass a copy to look without touching).
+        """
+        preamble = await self._preamble(current_user_input)
+        view = self.render_view(memory.snapshot(), memory.state)
+        estimated = self.estimate(memory, view, preamble)
 
-        # Memory-augmented dynamic preamble. Appended at the END of the
-        # message list so the stable conversation prefix stays cacheable.
-        preamble: list[AnyMessage] = []
-        if self._memory is not None and current_user_input is not None:
-            facts = await self._memory.relevant_facts(current_user_input)
-            if facts:
-                preamble.append(
-                    UserMessage(
-                        content=_relevant_context_block(facts),
-                        metadata={"system": "relevant_context"},
-                    )
-                )
-            summary = await self._memory.rolling_summary()
-            if summary:
-                preamble.append(
-                    UserMessage(
-                        content=f"<long_term_summary>\n{summary}\n</long_term_summary>",
-                        metadata={"system": "long_term_summary"},
-                    )
-                )
-                if self._trace is not None:
-                    self._trace.record_event(
-                        EventType.MEMORY_READ,
-                        name="rolling_summary",
-                        payload={"chars": len(summary)},
-                    )
+        trim: TrimOutcome | None = None
+        if allow_trim and estimated > self._limit:
+            trim = self._trim(memory, estimated)
+            if trim.applied:
+                view = self.render_view(memory.snapshot(), memory.state)
+                estimated = trim.estimated_after
 
-        threshold = int(budget * self._cfg.trigger_ratio)
-        if self._cfg.enabled and self._calibrated(current) > threshold:
-            # Step 1 — truncate verbose tool results (free, not persisted).
-            working, reclaimed = _truncate_tool_results(
-                working, self._cfg.tool_result_truncate_threshold
-            )
-            if reclaimed > 0:
-                applied.append(f"truncate_tool_results(-{reclaimed} tok)")
-                if self._trace is not None:
-                    self._trace.record_event(
-                        EventType.COMPACTION,
-                        name="tool_result_truncation",
-                        payload={"reclaimed_tokens": reclaimed},
-                    )
-            current = sum(estimate_message_tokens(m) for m in working)
-
-        if self._cfg.enabled and self._calibrated(current) > threshold:
-            # Step 2 — sliding window (free, not persisted).
-            working, reclaimed = _sliding_window(working, self._cfg.sliding_window_min_turns)
-            if reclaimed > 0:
-                applied.append(f"sliding_window(-{reclaimed} tok)")
-                if self._trace is not None:
-                    self._trace.record_event(
-                        EventType.COMPACTION,
-                        name="sliding_window",
-                        payload={"reclaimed_tokens": reclaimed},
-                    )
-            current = sum(estimate_message_tokens(m) for m in working)
-
-        if self._cfg.enabled and self._calibrated(current) > threshold and self._summarizer is not None:
-            # Step 3 — selective summary (1 LLM call; persisted). The cutoff
-            # is sized to land comfortably below the trigger threshold so the
-            # next turn does not immediately re-summarize.
-            target_raw = int(threshold * 0.6 / max(self._calibration, 1e-9))
-            working, reclaimed, summary = await self._selective_summary(
-                working, current_tokens=current, target_tokens=target_raw
-            )
-            if reclaimed > 0:
-                applied.append(f"selective_summary(-{reclaimed} tok)")
-                if self._trace is not None:
-                    self._trace.record_event(
-                        EventType.COMPACTION,
-                        name="selective_summary",
-                        payload={"reclaimed_tokens": reclaimed},
-                    )
-                if summary:
-                    summary_msgs.append(_summary_message(summary))
-                persist_needed = True
-            current = sum(estimate_message_tokens(m) for m in working)
-
-        if self._cfg.enabled and self._calibrated(current) > budget and self._summarizer is not None:
-            # Step 4 — full compaction (1 LLM call; persisted).
-            working, reclaimed, summary = await self._full_compaction(working)
-            if reclaimed > 0:
-                applied.append(f"full_compaction(-{reclaimed} tok)")
-                if self._trace is not None:
-                    self._trace.record_event(
-                        EventType.COMPACTION,
-                        name="full_compaction",
-                        payload={"reclaimed_tokens": reclaimed},
-                    )
-                if summary:
-                    summary_msgs.append(_summary_message(summary))
-                persist_needed = True
-            current = sum(estimate_message_tokens(m) for m in working)
-
-        persist: list[AnyMessage] | None = None
-        if persist_needed:
-            persist = summary_msgs + working
-
-        assembled: list[AnyMessage] = (summary_msgs + working) + preamble
-        estimated = sum(estimate_message_tokens(m) for m in assembled)
-        self._last_estimate_total = estimated + estimate_tokens(self._system_prompt)
+        tools_raw = self._tools_raw()
+        self._pending = _PendingCall(
+            epoch=memory.epoch,
+            view_len=len(view),
+            raw_total=self._system_raw + tools_raw + _raw(view) + _raw(preamble),
+            preamble_tokens=self._calibrated(_raw(preamble)),
+            tools_raw=tools_raw,
+        )
         return AssembledContext(
             system_prompt=self._system_prompt,
-            messages=assembled,
+            messages=view + preamble,
             estimated_tokens=estimated,
-            compaction_applied=applied,
-            persist=persist,
+            trim=trim,
         )
 
-    # ---------- LLM-call-driven strategies ----------
-    async def _selective_summary(
-        self,
-        messages: list[AnyMessage],
-        *,
-        current_tokens: int,
-        target_tokens: int,
-    ) -> tuple[list[AnyMessage], int, str]:
-        if not self._summarizer:
-            return messages, 0, ""
-        # Summarize at least the oldest 30%, and as much more as needed to
-        # bring the estimate down to `target_tokens` (keeping ≥ 2 messages).
-        need = max(0, current_tokens - target_tokens)
-        acc = 0
-        cutoff = 0
-        for i, m in enumerate(messages[:-2]):
-            acc += estimate_message_tokens(m)
-            cutoff = i + 1
-            if acc >= need:
-                break
-        cutoff = max(cutoff, max(1, int(len(messages) * 0.30)))
-        cutoff = min(cutoff, max(0, len(messages) - 2))
-        # The kept suffix must itself be a valid conversation start.
-        cutoff = _safe_forward_cut(messages, cutoff)
-        if cutoff <= 0:
-            return messages, 0, ""
-        to_summarize = messages[:cutoff]
-        keep = messages[cutoff:]
-        before_tokens = sum(estimate_message_tokens(m) for m in to_summarize)
-        summary = await self._summarize_batch(to_summarize)
-        after_tokens = estimate_tokens(summary)
-        reclaimed = max(0, before_tokens - after_tokens)
-        return keep, reclaimed, summary
-
-    async def _full_compaction(
-        self, messages: list[AnyMessage]
-    ) -> tuple[list[AnyMessage], int, str]:
-        if not self._summarizer:
-            return messages, 0, ""
-        keep_n = self._cfg.full_compaction_min_recent_turns * 2  # turn ≈ 2 messages
-        keep_n = max(2, keep_n)
-        if len(messages) <= keep_n:
-            to_summarize = list(messages)
-            keep: list[AnyMessage] = []
-        else:
-            cutoff = _safe_forward_cut(messages, len(messages) - keep_n)
-            if cutoff <= 0:
-                to_summarize = list(messages)
-                keep = []
-            else:
-                to_summarize = messages[:cutoff]
-                keep = messages[cutoff:]
-        before_tokens = sum(estimate_message_tokens(m) for m in to_summarize)
-        summary = await self._summarize_batch(to_summarize)
-        after_tokens = estimate_tokens(summary)
-        reclaimed = max(0, before_tokens - after_tokens)
-        return keep, reclaimed, summary
-
-    async def _summarize_batch(self, messages: list[AnyMessage]) -> str:
-        if not messages or self._summarizer is None or not self._summarizer_model:
-            return ""
-        flattened = _flatten_for_summary(messages)
-        prompt = (
-            "Summarize the following agent conversation into a structured, terse digest. "
-            "Preserve concrete facts (names, ids, decisions, errors, file paths, numbers). "
-            "Use under "
-            f"{self._cfg.summary_max_tokens} tokens. Output plain prose, no preamble."
-        )
-        try:
-            resp = await self._summarizer.call(
-                system=prompt,
-                messages=[UserMessage(content=flattened)],
-                tools=[],
-                model=self._summarizer_model,
-                max_tokens=self._cfg.summary_max_tokens,
-                temperature=None,
+    async def _preamble(self, current_user_input: str | None) -> list[AnyMessage]:
+        """Per-call memory context, appended after the history."""
+        preamble: list[AnyMessage] = []
+        if self._memory is None or current_user_input is None:
+            return preamble
+        facts = await self._memory.relevant_facts(current_user_input)
+        if facts:
+            preamble.append(
+                UserMessage(
+                    content=_relevant_context_block(facts),
+                    metadata={"system": "relevant_context"},
+                )
             )
-            return resp.assistant_message.content if isinstance(
-                resp.assistant_message.content, str
-            ) else ""
-        except Exception:
-            return ""
+        summary = await self._memory.rolling_summary()
+        if summary:
+            preamble.append(
+                UserMessage(
+                    content=f"<long_term_summary>\n{summary}\n</long_term_summary>",
+                    metadata={"system": "long_term_summary"},
+                )
+            )
+            if self._trace is not None:
+                self._trace.record_event(
+                    EventType.MEMORY_READ,
+                    name="rolling_summary",
+                    payload={"chars": len(summary)},
+                )
+        return preamble
+
+    # ----------------------------------------------------------------- trim
+    def _trim(self, memory: ShortTermMemory, estimated_before: int) -> TrimOutcome:
+        state, drop, outcome = self.plan_trim(memory.snapshot(), memory.state, estimated_before)
+        if outcome.applied:
+            memory.state = state
+            memory.drop_head(drop)
+            self._noop_epoch = None
+            self._record(outcome)
+        elif self._noop_epoch != memory.epoch:
+            # Recorded once: the same history would give the same answer on
+            # every following call until something is removed or replaced.
+            self._noop_epoch = memory.epoch
+            self._record(outcome)
+        return outcome
+
+    def _record(self, outcome: TrimOutcome) -> None:
+        if self._trace is not None:
+            self._trace.record_event(EventType.COMPACTION, name="trim", payload=outcome.payload())
+
+    def plan_trim(
+        self,
+        history: list[AnyMessage],
+        state: ContextState,
+        estimated_before: int,
+    ) -> tuple[ContextState, int, TrimOutcome]:
+        """Decide a trim without applying it: ``(new_state, drop_count, outcome)``.
+
+        *new_state* is expressed against *history* as it is now — apply it
+        first, then `drop_head(drop_count)`, which shifts its counters.
+        Savings are measured in raw tokens and scaled by the calibration, then
+        subtracted from *estimated_before*, so the outcome stays on the same
+        (anchored) scale as the estimate that triggered it.
+        """
+        limit, target = self._limit, self.trim_target
+        starts = _turn_starts(history)
+        current_turn = starts[-1] if starts else len(history)
+        raw_before = _raw(self.render_view(history, state))
+
+        # 1. Clear all but the newest k clearable results.
+        clearable = self._clearable_ordinals(history)
+        keep = self.keep_recent_results()
+        cleared_zone = state.cleared_results
+        if len(clearable) > keep:
+            cleared_zone = max(cleared_zone, clearable[-keep])
+        cleared_now = _count_below(clearable, cleared_zone) - _count_below(
+            clearable, state.cleared_results
+        )
+
+        # Whatever changes from here on, reasoning before the current turn goes
+        # with it: its signatures cover the prefix being edited.
+        candidate = ContextState(
+            pinned=state.pinned,
+            cleared_results=cleared_zone,
+            reasoning_cut=max(state.reasoning_cut, current_turn),
+        )
+        tokens = [estimate_message_tokens(m) for m in self._render_history(history, candidate)]
+        suffix = [0] * (len(tokens) + 1)
+        for i in range(len(tokens) - 1, -1, -1):
+            suffix[i] = suffix[i + 1] + tokens[i]
+
+        def after(pinned: AnyMessage | None, drop: int) -> int:
+            kept = suffix[drop] + (estimate_message_tokens(pinned) if pinned is not None else 0)
+            return estimated_before - self._calibrated(raw_before - kept)
+
+        estimated = after(state.pinned, 0) if cleared_now else estimated_before
+
+        # 2. Drop whole oldest turns until the target is reached, keeping the
+        #    newest turns and pinning the conversation's first user message.
+        drop = 0
+        if estimated > target:
+            first_index, first = _first_user_message(history)
+            droppable = starts[: max(0, len(starts) - (KEEP_RECENT_TURNS - 1))]
+            for cut in (s for s in droppable if s > 0):
+                if state.pinned is None and first is not None and first_index < cut:
+                    candidate.pinned = first
+                drop, estimated = cut, after(candidate.pinned, cut)
+                if estimated <= target:
+                    break
+
+        changed = cleared_now > 0 or drop > 0
+        useful = estimated <= int(limit * (1 - MIN_TRIM_HEADROOM))
+        applied = changed and useful
+        if not applied:
+            return state, 0, TrimOutcome(
+                applied=False,
+                estimated_before=estimated_before,
+                estimated_after=estimated_before,
+                limit=limit,
+                target=target,
+            )
+        return candidate, drop, TrimOutcome(
+            applied=True,
+            estimated_before=estimated_before,
+            estimated_after=estimated,
+            limit=limit,
+            target=target,
+            cleared_results=cleared_now,
+            dropped_messages=drop,
+            dropped_turns=sum(1 for s in starts if s < drop),
+            pinned=state.pinned is None and candidate.pinned is not None,
+            reasoning_cut=candidate.reasoning_cut > state.reasoning_cut,
+        )
+
+    def _clearable_ordinals(self, history: list[AnyMessage]) -> list[int]:
+        """Ordinals (over all tool results, in history order) of clearable ones."""
+        ordinals: list[int] = []
+        ordinal = 0
+        for message in history:
+            if isinstance(message, ToolResultMessage):
+                for result in message.content:
+                    if self._clearable(result):
+                        ordinals.append(ordinal)
+                    ordinal += 1
+        return ordinals
 
 
-def _summary_message(summary: str) -> UserMessage:
-    """Persisted compaction summary — part of stable history (cacheable),
-    so it deliberately does NOT carry the volatile `system` metadata key."""
-    return UserMessage(
-        content=f"<summary>\n{summary}\n</summary>",
-        metadata={"compaction": "summary"},
+# ---------------------------------------------------------------- helpers
+def _raw(messages: list[AnyMessage]) -> int:
+    return sum(estimate_message_tokens(m) for m in messages)
+
+
+def _cleared(result: ToolResult) -> ToolResult:
+    note = CLEAR_NOTE.format(name=result.name, tokens=estimate_tokens(result.as_text()))
+    return ToolResult(
+        tool_use_id=result.tool_use_id,
+        name=result.name,
+        content=note,
+        is_error=False,
+        duration_ms=result.duration_ms,
     )
 
 
-# -------- pure compaction helpers --------
-def _truncate_tool_results(
-    messages: list[AnyMessage], threshold_tokens: int
-) -> tuple[list[AnyMessage], int]:
-    out: list[AnyMessage] = []
-    reclaimed = 0
-    for m in messages:
-        if isinstance(m, ToolResultMessage):
-            new_results: list[ToolResult] = []
-            for tr in m.content:
-                text = tr.as_text()
-                if estimate_tokens(text) > threshold_tokens:
-                    truncated = text[: threshold_tokens * 4]
-                    note = (
-                        f"\n[result truncated — original ≈ {estimate_tokens(text)} tokens, "
-                        f"showing first {threshold_tokens}]"
-                    )
-                    reclaimed += estimate_tokens(text) - threshold_tokens
-                    new_results.append(
-                        ToolResult(
-                            tool_use_id=tr.tool_use_id,
-                            name=tr.name,
-                            content=truncated + note,
-                            is_error=tr.is_error,
-                            duration_ms=tr.duration_ms,
-                        )
-                    )
-                else:
-                    new_results.append(tr)
-            out.append(ToolResultMessage(content=new_results, metadata=m.metadata))
-        else:
-            out.append(m)
-    return out, reclaimed
+def _is_user_turn(message: AnyMessage) -> bool:
+    return isinstance(message, UserMessage) and not isinstance(message, ToolResultMessage)
 
 
-def _is_safe_cut_point(messages: list[AnyMessage], cutoff: int) -> bool:
-    """A cut at `cutoff` (dropping messages[:cutoff]) is safe iff the kept
-    list starts with a plain UserMessage. That single condition guarantees
-    both provider invariants:
-      - the conversation starts with a user turn (Anthropic requirement);
-      - no assistant(tool_calls) → ToolResultMessage pair is split, because
-        a ToolResultMessage always immediately follows its assistant message
-        and is not a plain UserMessage.
+def _turn_starts(history: list[AnyMessage]) -> list[int]:
+    """Indices where a turn begins: a user message not preceded by one.
+
+    Consecutive user messages (injected context followed by the user's own
+    message) open a single turn, so cutting at a turn start never separates
+    them — and never separates a tool call from its result.
     """
-    cur = messages[cutoff]
-    return isinstance(cur, UserMessage) and not isinstance(cur, ToolResultMessage)
+    return [
+        i
+        for i, message in enumerate(history)
+        if _is_user_turn(message) and (i == 0 or not _is_user_turn(history[i - 1]))
+    ]
 
 
-def _safe_forward_cut(messages: list[AnyMessage], desired_cutoff: int) -> int:
-    """Walk the cutoff backwards until it lands on a safe point (or 0)."""
-    cutoff = min(desired_cutoff, len(messages) - 1)
-    while cutoff > 0 and not _is_safe_cut_point(messages, cutoff):
-        cutoff -= 1
-    return cutoff
+def _first_user_message(messages: list[AnyMessage]) -> tuple[int, AnyMessage | None]:
+    """The first message the user wrote (not context the framework injected)."""
+    for index, message in enumerate(messages):
+        if _is_user_turn(message) and "context" not in message.metadata:
+            return index, message
+    return len(messages), None
 
 
-def _sliding_window(
-    messages: list[AnyMessage], min_messages: int
-) -> tuple[list[AnyMessage], int]:
-    """Drop oldest messages, keeping at least `min_messages` most recent.
-
-    The kept list must start with a plain UserMessage (see
-    `_is_safe_cut_point`); if no safe split exists, everything is kept.
-    """
-    if len(messages) <= min_messages:
-        return messages, 0
-
-    cutoff = _safe_forward_cut(messages, len(messages) - min_messages)
-    if cutoff <= 0:
-        return messages, 0
-
-    dropped = messages[:cutoff]
-    reclaimed = sum(estimate_message_tokens(m) for m in dropped)
-    return messages[cutoff:], reclaimed
-
-
-def _flatten_for_summary(messages: list[AnyMessage]) -> str:
-    lines: list[str] = []
-    for m in messages:
-        if isinstance(m, ToolResultMessage):
-            for tr in m.content:
-                tag = "tool-error" if tr.is_error else "tool"
-                lines.append(f"[{tag}:{tr.name}] {tr.as_text()[:400]}")
-        elif isinstance(m, UserMessage):
-            content = m.content if isinstance(m.content, str) else json.dumps(m.content, default=str)
-            lines.append(f"[user] {content}")
-        elif isinstance(m, AssistantMessage):
-            text = m.content if isinstance(m.content, str) else ""
-            if text:
-                lines.append(f"[assistant] {text}")
-            for tc in m.tool_calls:
-                lines.append(f"[assistant→tool] {tc.name}({json.dumps(tc.arguments, default=str)})")
-    return "\n".join(lines)
+def _count_below(ordinals: list[int], bound: int) -> int:
+    return bisect.bisect_left(ordinals, bound)
 
 
 def _relevant_context_block(facts: list[dict[str, Any]]) -> str:

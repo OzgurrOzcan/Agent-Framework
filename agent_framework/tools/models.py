@@ -38,6 +38,9 @@ class ToolMetadata:
     # Results larger than this many tokens are cut (head + tail) when they are
     # produced. None = the agent's default (`AgentConfig.max_tool_result_tokens`).
     max_result_tokens: int | None = None
+    # False = this tool's old results are never replaced by a "cleared" note
+    # when the context is trimmed (for results the model must keep seeing).
+    clear_old_results: bool = True
 
     def __post_init__(self) -> None:
         validate_result_cap(self.max_result_tokens, f"Tool {self.name!r}: max_result_tokens")
