@@ -35,7 +35,11 @@ from collections.abc import AsyncIterator
 from typing import Any, AsyncGenerator
 
 from agent_framework.core.config import AgentConfig
-from agent_framework.core.context_manager import ContextManager
+from agent_framework.core.context_manager import (
+    AssembledContext,
+    ContextManager,
+    ContextReport,
+)
 from agent_framework.core.message import (
     AnyMessage,
     AssistantMessage,
@@ -106,6 +110,8 @@ class AgentResult:
     state: LoopState
     error: Exception | None = None
     trace: ExecutionTrace | None = None
+    # What the run's last LLM call was sent (with dry_run: would be sent).
+    context: ContextReport | None = None
 
     def __str__(self) -> str:
         return self.final_message
@@ -197,17 +203,18 @@ class AgentLoop:
             )
         self._running = True
 
-    async def _begin_run(self, user_input: str) -> None:
+    async def _begin_run(self, user_input: str, memory: ShortTermMemory | None = None) -> None:
         """Start a run's history: fresh without memory, repaired with it, then
         this run's memory context, then the user's message."""
+        memory = memory if memory is not None else self.short_term
         if not self.retain_history:
-            self.short_term.clear()
+            memory.clear()
         else:
-            self._answer_unanswered_calls()
-        await self.context.start_run(self.short_term, user_input)
-        self.short_term.append(UserMessage(content=user_input))
+            _answer_unanswered_calls(memory)
+        await self.context.start_run(memory, user_input)
+        memory.append(UserMessage(content=user_input))
 
-    async def _assemble(self, turn: int):
+    async def _assemble(self, turn: int) -> AssembledContext:
         """The view for this run's *turn*-th call (trimmed where allowed)."""
         return await self.context.assemble(
             self.short_term,
@@ -248,31 +255,6 @@ class AgentLoop:
             turn=turn_num,
             estimated_tokens=estimated_tokens,
             limit=usable,
-        )
-
-    def _answer_unanswered_calls(self) -> None:
-        """Give tool calls left without results a result before going on.
-
-        `complete()` returns tool calls as data without running them, and a
-        response cut off by the context window can end in one. Sending such a
-        call again without its result is rejected by every provider, so a
-        remembered conversation would fail on its next run.
-        """
-        last = self.short_term.last
-        if not isinstance(last, AssistantMessage) or not last.tool_calls:
-            return
-        self.short_term.append(
-            ToolResultMessage(
-                content=[
-                    ToolResult(
-                        tool_use_id=tc.id,
-                        name=tc.name,
-                        content="Not executed: this tool call was never run.",
-                        is_error=True,
-                    )
-                    for tc in last.tool_calls
-                ]
-            )
         )
 
     def _tool_choice_for_turn(self, policy: LoopPolicy, turn: int):
@@ -410,6 +392,7 @@ class AgentLoop:
         await self._begin_run(user_input)
 
         stop_reason = StopReason.END_TURN
+        report: ContextReport | None = None
         try:
             while True:
                 # Layer 2: hard iteration ceiling.
@@ -436,6 +419,7 @@ class AgentLoop:
                     # Render what is sent; trims the history first when the
                     # prompt has outgrown max_context_tokens.
                     assembled = await self._assemble(state.turn)
+                    report = _report(assembled, self.context.max_context_tokens, None)
                     overflow = self._window_exceeded(assembled.estimated_tokens, turn_num)
                     if overflow is not None:
                         raise overflow
@@ -479,15 +463,18 @@ class AgentLoop:
                                 state=state,
                                 error=exc,
                                 trace=self.trace,
+                                context=report,
                             )
                         cost = self._note_usage(response.usage, response.applied_edits)
                         state.cumulative_cost_usd = self.cost.snapshot()[0]
                         llm_span.set_usage(response.usage, cost)
+                        report = _report(
+                            assembled, self.context.max_context_tokens, response.usage
+                        )
                         llm_span.update(
                             model=self.config.model,
                             stop_reason=response.stop_reason.value,
-                            ctx_tokens=assembled.estimated_tokens,
-                            trimmed=assembled.trim is not None and assembled.trim.applied,
+                            **report.to_dict(),
                         )
 
                     # Layer 4: budget guard.
@@ -616,6 +603,7 @@ class AgentLoop:
                 state=state,
                 error=exc,
                 trace=self.trace,
+                context=report,
             )
         except asyncio.CancelledError:
             self.trace.record_event(
@@ -639,7 +627,45 @@ class AgentLoop:
             state=state,
             error=None,
             trace=self.trace,
+            context=report,
         )
+
+    # ===================== dry run =====================
+
+    async def dry_run(self, user_input: str, *, policy: LoopPolicy) -> AgentResult:
+        """What the first call of `run(user_input)` would send — without
+        calling the model, summarizing, or saving anything.
+
+        Built on a copy: the stored history and its state are untouched. A
+        stateless agent shows a fresh run, as its next run would be.
+        """
+        self._acquire_run()
+        try:
+            with self.trace.start_span(
+                EventType.RUN,
+                name="run",
+                payload={
+                    **_policy_payload(
+                        policy, streaming=False, retain_history=self.retain_history
+                    ),
+                    "dry_run": True,
+                },
+            ) as run_span:
+                memory = self.short_term.copy() if self.retain_history else ShortTermMemory()
+                await self._begin_run(user_input, memory)
+                assembled = await self.context.assemble(memory, allow_trim=True, dry_run=True)
+                report = _report(assembled, self.context.max_context_tokens, None)
+                run_span.update(stop_reason=StopReason.DRY_RUN.value, **report.to_dict())
+                return AgentResult(
+                    final_message="",
+                    messages=assembled.messages,
+                    stop_reason=StopReason.DRY_RUN,
+                    state=LoopState(),
+                    trace=self.trace,
+                    context=report,
+                )
+        finally:
+            self._running = False
 
     # ===================== streaming run =====================
 
@@ -738,6 +764,7 @@ class AgentLoop:
                 text_parts: list[str] = []
                 reasoning_blocks: list[ReasoningContent] = []
                 stop_reason = StopReason.END_TURN
+                call_usage: TokenUsage | None = None
 
                 with self.trace.start_span(
                     EventType.LLM_CALL,
@@ -789,6 +816,7 @@ class AgentLoop:
                                     cost = self._note_usage(usage, edits)
                                     state.cumulative_cost_usd = self.cost.snapshot()[0]
                                     llm_span.set_usage(usage, cost)
+                                    call_usage = usage
                                 elif ctype == StreamChunkType.STOP:
                                     sr = chunk.payload.get("stop_reason", "end_turn")
                                     try:
@@ -831,8 +859,9 @@ class AgentLoop:
                     llm_span.update(
                         model=self.config.model,
                         stop_reason=stop_reason.value,
-                        ctx_tokens=assembled.estimated_tokens,
-                        trimmed=assembled.trim is not None and assembled.trim.applied,
+                        **_report(
+                            assembled, self.context.max_context_tokens, call_usage
+                        ).to_dict(),
                     )
 
                 # Layer 4: budget guard.
@@ -1026,6 +1055,47 @@ class AgentLoop:
 
 
 # ---- pure helpers ----
+
+def _answer_unanswered_calls(memory: ShortTermMemory) -> None:
+    """Give tool calls left without results a result before going on.
+
+    `complete()` returns tool calls as data without running them, and a
+    response cut off by the context window can end in one. Sending such a
+    call again without its result is rejected by every provider, so a
+    remembered conversation would fail on its next run.
+    """
+    last = memory.last
+    if not isinstance(last, AssistantMessage) or not last.tool_calls:
+        return
+    memory.append(
+        ToolResultMessage(
+            content=[
+                ToolResult(
+                    tool_use_id=tc.id,
+                    name=tc.name,
+                    content="Not executed: this tool call was never run.",
+                    is_error=True,
+                )
+                for tc in last.tool_calls
+            ]
+        )
+    )
+
+
+def _report(assembled: AssembledContext, limit: int, usage: TokenUsage | None) -> ContextReport:
+    return ContextReport(
+        messages_sent=len(assembled.messages),
+        messages_stored=assembled.messages_stored,
+        estimated_tokens=assembled.estimated_tokens,
+        max_context_tokens=limit,
+        cleared_results=assembled.cleared_results,
+        reasoning_dropped=assembled.reasoning_dropped,
+        trimmed=assembled.trim is not None and assembled.trim.applied,
+        input_tokens=usage.input_tokens if usage is not None else 0,
+        cache_read_tokens=usage.cache_read_input_tokens if usage is not None else 0,
+        cache_write_tokens=usage.cache_creation_input_tokens if usage is not None else 0,
+    )
+
 
 @contextlib.asynccontextmanager
 async def _closing(

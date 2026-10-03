@@ -165,6 +165,8 @@ class MockLLMProvider(BaseProviderAdapter):
             payload={
                 "input_tokens": resp.usage.input_tokens,
                 "output_tokens": resp.usage.output_tokens,
+                "cache_read_input_tokens": resp.usage.cache_read_input_tokens,
+                "cache_creation_input_tokens": resp.usage.cache_creation_input_tokens,
                 "applied_edits": [e.to_dict() for e in resp.applied_edits],
             },
         )

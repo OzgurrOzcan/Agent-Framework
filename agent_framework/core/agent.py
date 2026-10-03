@@ -333,6 +333,7 @@ class Agent:
         max_turns: int | None = None,
         max_tool_rounds: int | None = None,
         tool_choice: ToolChoice | None = None,
+        dry_run: bool = False,
     ) -> AgentResult:
         """Run the agent loop.
 
@@ -343,16 +344,23 @@ class Agent:
             (bounded by max_turns).
           - tool_choice: constrain the FIRST model call ("any"/"tool" force
             tool use once; later turns fall back to auto).
+          - dry_run: build what the first call would send — trimmed if it
+            would be — and return it as `result.messages` with
+            `result.context`, without calling the model, summarizing or
+            saving. The stored history is untouched.
+
+        `result.context` reports what the last call was sent: message counts,
+        the token estimate, cleared results and the provider's cache hits.
         """
         await self._ensure_mcp()
-        return await self._loop.run(
-            user_input,
-            policy=self._run_policy(
-                max_turns=max_turns,
-                max_tool_rounds=max_tool_rounds,
-                tool_choice=tool_choice,
-            ),
+        policy = self._run_policy(
+            max_turns=max_turns,
+            max_tool_rounds=max_tool_rounds,
+            tool_choice=tool_choice,
         )
+        if dry_run:
+            return await self._loop.dry_run(user_input, policy=policy)
+        return await self._loop.run(user_input, policy=policy)
 
     async def run_stream(
         self,

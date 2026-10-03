@@ -122,7 +122,7 @@ async def test_no_mid_run_trim_on_bound_models():
 
     assert result.final_message == "done"
     llm_calls = [e for e in agent.get_trace().all_spans() if e.event_type is EventType.LLM_CALL]
-    assert llm_calls[-1].payload["ctx_tokens"] > 8_000  # the run did outgrow the limit ...
+    assert llm_calls[-1].payload["estimated_tokens"] > 8_000  # the run did outgrow the limit ...
     assert not applied_trims(agent)  # ... and still nothing already sent was edited
     for earlier, later in zip(mock.call_log, mock.call_log[1:]):
         sent_before = earlier["messages"]

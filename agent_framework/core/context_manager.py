@@ -145,6 +145,61 @@ class AssembledContext:
     estimated_tokens: int
     # Set when this call's estimate exceeded the limit.
     trim: TrimOutcome | None = None
+    # Messages in the stored history (the view adds summary/pinned ones).
+    messages_stored: int = 0
+    # Tool results shown as a "cleared" note in this view.
+    cleared_results: int = 0
+    # Assistant messages whose reasoning this view leaves out.
+    reasoning_dropped: int = 0
+
+
+@dataclass(frozen=True)
+class ContextReport:
+    """What one LLM call was sent, and how the provider's cache served it.
+
+    Recorded on every LLM_CALL span and returned as `AgentResult.context` for
+    the run's last call (or, with `run(dry_run=True)`, for the call that
+    would be made).
+    """
+
+    messages_sent: int
+    messages_stored: int
+    estimated_tokens: int
+    max_context_tokens: int
+    cleared_results: int
+    reasoning_dropped: int
+    trimmed: bool
+    # Provider-reported; zero until the call has been made.
+    input_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    @property
+    def cache_hit_ratio(self) -> float:
+        """Share of the prompt served from the provider's cache (0.0–1.0)."""
+        total = self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+        return self.cache_read_tokens / total if total else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "messages_sent": self.messages_sent,
+            "messages_stored": self.messages_stored,
+            "estimated_tokens": self.estimated_tokens,
+            "max_context_tokens": self.max_context_tokens,
+            "cleared_results": self.cleared_results,
+            "reasoning_dropped": self.reasoning_dropped,
+            "trimmed": self.trimmed,
+            "input_tokens": self.input_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "cache_hit_ratio": round(self.cache_hit_ratio, 4),
+        }
+
+
+@dataclass
+class _RenderStats:
+    cleared_results: int = 0
+    reasoning_dropped: int = 0
 
 
 @dataclass(frozen=True)
@@ -226,14 +281,19 @@ class ContextManager:
         return max(1, min(KEEP_RECENT_RESULTS, fit))
 
     # ------------------------------------------------------------- the view
-    def render_view(self, history: list[AnyMessage], state: ContextState) -> list[AnyMessage]:
+    def render_view(
+        self,
+        history: list[AnyMessage],
+        state: ContextState,
+        stats: _RenderStats | None = None,
+    ) -> list[AnyMessage]:
         """What the model sees for *history* under *state*. Pure; never mutates."""
         view: list[AnyMessage] = []
         if state.summary:
             view.append(self._summary_message(state.summary))
         if state.pinned is not None:
             view.append(state.pinned)
-        view.extend(self._render_history(history, state))
+        view.extend(self._render_history(history, state, stats))
         return view
 
     def _summary_message(self, segments: list[str]) -> UserMessage:
@@ -252,8 +312,12 @@ class ContextManager:
         return self._summary_cache[1]
 
     def _render_history(
-        self, history: list[AnyMessage], state: ContextState
+        self,
+        history: list[AnyMessage],
+        state: ContextState,
+        stats: _RenderStats | None = None,
     ) -> list[AnyMessage]:
+        stats = stats if stats is not None else _RenderStats()
         out: list[AnyMessage] = []
         ordinal = 0  # tool results seen so far, in history order
         for index, message in enumerate(history):
@@ -263,6 +327,7 @@ class ContextManager:
                 for result in message.content:
                     if ordinal < state.cleared_results and self._clearable(result):
                         rendered.append(_cleared(result))
+                        stats.cleared_results += 1
                         changed = True
                     else:
                         rendered.append(result)
@@ -274,6 +339,7 @@ class ContextManager:
                 and message.reasoning
             ):
                 out.append(dataclasses.replace(message, reasoning=[]))
+                stats.reasoning_dropped += 1
             else:
                 out.append(message)
         return out
@@ -404,45 +470,60 @@ class ContextManager:
         memory: ShortTermMemory,
         *,
         allow_trim: bool = True,
+        dry_run: bool = False,
     ) -> AssembledContext:
         """Render the view for the next call, trimming *memory* first if needed.
 
         A trim mutates *memory* (pass a copy to look without touching).
         `allow_trim=False` renders as-is even above the limit — for models that
-        bind reasoning to the prefix, in the middle of a run.
+        bind reasoning to the prefix, in the middle of a run. `dry_run=True`
+        is for looking only: no call follows, so this manager's own state
+        (the token anchor, the once-only trim record) is left alone and trim
+        events are marked `dry_run`.
         """
-        view = self.render_view(memory.snapshot(), memory.state)
+        stats = _RenderStats()
+        view = self.render_view(memory.snapshot(), memory.state, stats)
         estimated = self.estimate(memory, view)
 
         trim: TrimOutcome | None = None
         if allow_trim and estimated > self._limit:
-            trim = self._trim(memory, estimated)
+            trim = self._trim(memory, estimated, dry_run=dry_run)
             if trim.applied:
-                view = self.render_view(memory.snapshot(), memory.state)
+                stats = _RenderStats()
+                view = self.render_view(memory.snapshot(), memory.state, stats)
                 estimated = trim.estimated_after
 
-        tools_raw = self._tools_raw()
-        self._pending = _PendingCall(
-            epoch=memory.epoch,
-            view_len=len(view),
-            raw_total=self._system_raw + tools_raw + _raw(view),
-            tools_raw=tools_raw,
-        )
+        if not dry_run:
+            tools_raw = self._tools_raw()
+            self._pending = _PendingCall(
+                epoch=memory.epoch,
+                view_len=len(view),
+                raw_total=self._system_raw + tools_raw + _raw(view),
+                tools_raw=tools_raw,
+            )
         return AssembledContext(
             system_prompt=self._system_prompt,
             messages=view,
             estimated_tokens=estimated,
             trim=trim,
+            messages_stored=len(memory),
+            cleared_results=stats.cleared_results,
+            reasoning_dropped=stats.reasoning_dropped,
         )
 
     # ----------------------------------------------------------------- trim
-    def _trim(self, memory: ShortTermMemory, estimated_before: int) -> TrimOutcome:
+    def _trim(
+        self, memory: ShortTermMemory, estimated_before: int, *, dry_run: bool = False
+    ) -> TrimOutcome:
         state, drop, outcome = self.plan_trim(memory.snapshot(), memory.state, estimated_before)
         if outcome.applied:
             memory.state = state
             memory.drop_head(drop)
-            self._noop_epoch = None
-            self._record(outcome)
+            if not dry_run:
+                self._noop_epoch = None
+            self._record(outcome, dry_run=dry_run)
+        elif dry_run:
+            self._record(outcome, dry_run=True)
         elif self._noop_epoch != memory.epoch:
             # Recorded once: the same history would give the same answer on
             # every following call until something is removed or replaced.
@@ -450,9 +531,12 @@ class ContextManager:
             self._record(outcome)
         return outcome
 
-    def _record(self, outcome: TrimOutcome) -> None:
+    def _record(self, outcome: TrimOutcome, *, dry_run: bool = False) -> None:
         if self._trace is not None:
-            self._trace.record_event(EventType.COMPACTION, name="trim", payload=outcome.payload())
+            payload = outcome.payload()
+            if dry_run:
+                payload["dry_run"] = True
+            self._trace.record_event(EventType.COMPACTION, name="trim", payload=payload)
 
     def plan_trim(
         self,

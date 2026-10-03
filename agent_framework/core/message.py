@@ -25,9 +25,12 @@ class StopReason(str, enum.Enum):
     PAUSE_TURN = "pause_turn"
     # Safety classifiers declined the request (HTTP 200, not an error).
     REFUSAL = "refusal"
-    # The model hit the context-window limit (distinct from max_tokens).
+    # The model hit the context-window limit (distinct from max_tokens) — or
+    # the framework stopped a prompt that would not fit before sending it.
     CONTEXT_EXCEEDED = "model_context_window_exceeded"
     ERROR = "error"
+    # `run(dry_run=True)`: the view was built, no model was called.
+    DRY_RUN = "dry_run"
 
 
 @dataclass
