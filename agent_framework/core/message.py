@@ -94,12 +94,21 @@ class ToolResult:
     duration_ms: int | None = None
 
     def as_text(self) -> str:
-        if isinstance(self.content, str):
-            return self.content
-        try:
-            return json.dumps(self.content, default=str)
-        except Exception:
-            return str(self.content)
+        return content_as_text(self.content)
+
+
+def content_as_text(content: Any) -> str:
+    """The text a provider receives for a tool result's *content*.
+
+    Strings pass through; anything else is JSON-encoded (falling back to
+    `str()`), exactly as the adapters serialize it.
+    """
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, default=str)
+    except Exception:
+        return str(content)
 
 
 @dataclass

@@ -35,10 +35,24 @@ class ToolMetadata:
     tags: tuple[str, ...] = ()
     is_async: bool = True
     source: str = "native"  # "native" | "mcp:<server>"
+    # Results larger than this many tokens are cut (head + tail) when they are
+    # produced. None = the agent's default (`AgentConfig.max_tool_result_tokens`).
+    max_result_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        validate_result_cap(self.max_result_tokens, f"Tool {self.name!r}: max_result_tokens")
 
     def with_overrides(self, **changes: Any) -> "ToolMetadata":
         from dataclasses import replace
         return replace(self, **changes)
+
+
+def validate_result_cap(value: Any, label: str) -> None:
+    """Reject a token cap that is not a positive int (``None`` = no cap here)."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{label} must be a positive int or None, got {value!r}")
 
 
 # A tool function is either sync or async; the executor handles both.
