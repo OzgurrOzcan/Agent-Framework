@@ -254,6 +254,7 @@ class Agent:
             trace=self._trace,
         )
         self._checkpoints: dict[CheckpointId, dict[str, Any]] = {}
+        self._native_clearing = _native_clearing_available(self.config, self._provider)
 
         self._record_session_span()
 
@@ -270,6 +271,7 @@ class Agent:
             trace=self._trace,
             agent_id=self.agent_id,
             retain_history=self.config.memory is not None,
+            native_clearing=self._native_clearing,
         )
 
     # ===================== async construction =====================
@@ -520,6 +522,7 @@ class Agent:
                 if self._memory_backend is not None
                 else None
             ),
+            native_tool_result_clearing=self._native_clearing,
         )
         self._trace.record_event(EventType.SESSION, name="session", payload=payload)
 
@@ -593,6 +596,21 @@ def _resolve_config(config: str | AgentConfig, **overrides: Any) -> AgentConfig:
             f"{type(config).__name__}."
         )
     return config.replace(**supplied) if supplied else config
+
+
+def _native_clearing_available(config: AgentConfig, provider: BaseProviderAdapter) -> bool:
+    """Whether to ask the provider to clear old tool results server-side.
+
+    On for adapters that support it, talking to the vendor's own API. Off
+    for a custom `base_url` — a gateway or proxy may not forward the beta —
+    and when `request_extra` already carries the caller's own
+    `context_management`, which is theirs to control.
+    """
+    return (
+        bool(getattr(provider, "supports_tool_result_clearing", False))
+        and config.base_url is None
+        and "context_management" not in (config.request_extra or {})
+    )
 
 
 def _validate_memory(memory: MemoryConfig | None, backend: LongTermBackend | None) -> None:

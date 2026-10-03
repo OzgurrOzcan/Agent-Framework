@@ -195,6 +195,8 @@ class ContextManager:
         self._noop_epoch: int | None = None
         self._tools_raw_cache: tuple[tuple[str, ...], int] | None = None
         self._summary_cache: tuple[tuple[str, ...], UserMessage] | None = None
+        # (epoch, tokens) the provider cleared server-side at the last call.
+        self._provider_cleared: tuple[int, int] = (0, 0)
 
     # ------------------------------------------------------------ properties
     @property
@@ -320,15 +322,21 @@ class ContextManager:
             return anchor.tokens + self._calibrated(appended + tools_raw - anchor.tools_raw)
         return self._calibrated(self._system_raw + tools_raw + _raw(view))
 
-    def note_actual_tokens(self, actual_input_tokens: int) -> None:
+    def note_actual_tokens(self, actual_input_tokens: int, *, cleared_by_provider: int = 0) -> None:
         """Calibrate against the provider-reported size of the call just made.
 
         Pass the *full* prompt size (input + cache_read + cache_creation
-        tokens). Called by the loop after every LLM response; it also anchors
-        the next call's estimate.
+        tokens) and what the provider cleared server-side before counting:
+        the two together are the size of the prompt that was sent, which is
+        what the estimate describes. Called by the loop after every LLM
+        response; it also anchors the next call's estimate.
         """
         pending = self._pending
-        if actual_input_tokens <= 0 or pending is None or pending.raw_total <= 0:
+        if pending is None:
+            return
+        self._provider_cleared = (pending.epoch, max(0, cleared_by_provider))
+        actual_input_tokens += max(0, cleared_by_provider)
+        if actual_input_tokens <= 0 or pending.raw_total <= 0:
             return
         ratio = actual_input_tokens / pending.raw_total
         if not _PLAUSIBLE_RATIO[0] <= ratio <= _PLAUSIBLE_RATIO[1]:
@@ -341,6 +349,16 @@ class ContextManager:
             tokens=actual_input_tokens,
             tools_raw=pending.tools_raw,
         )
+
+    def provider_cleared_tokens(self, memory: ShortTermMemory) -> int:
+        """Tokens the provider cleared server-side at the last call.
+
+        The provider clears again on every call, so this much of the next
+        prompt will not reach the model either. Zero once *memory* was trimmed
+        or replaced: what was cleared then may no longer be there.
+        """
+        epoch, cleared = self._provider_cleared
+        return cleared if epoch == memory.epoch else 0
 
     # ------------------------------------------------------------- assembly
     async def start_run(self, memory: ShortTermMemory, user_input: str) -> None:

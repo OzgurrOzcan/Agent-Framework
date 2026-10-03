@@ -43,6 +43,57 @@ class ToolChoice:
             raise ValueError("ToolChoice(mode='tool') requires tool_name")
 
 
+@dataclass(frozen=True)
+class ToolResultClearing:
+    """Ask the provider to clear old tool results server-side (if it can).
+
+    Provider-neutral form of Anthropic's context editing: once the prompt
+    exceeds `trigger_tokens`, the provider replaces the oldest tool results
+    with a placeholder, keeping the newest `keep_results` and clearing only
+    if at least `clear_at_least_tokens` are freed. Results of `exclude_tools`
+    are never cleared. The provider edits its own copy, so the history sent
+    stays unchanged — which is why this is safe mid-run even on models that
+    bind reasoning to the prefix.
+    """
+
+    trigger_tokens: int
+    keep_results: int
+    clear_at_least_tokens: int
+    exclude_tools: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AppliedEdit:
+    """A server-side context edit the provider reports it applied."""
+
+    type: str
+    cleared_tool_uses: int = 0
+    cleared_input_tokens: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "cleared_tool_uses": self.cleared_tool_uses,
+            "cleared_input_tokens": self.cleared_input_tokens,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AppliedEdit:
+        return cls(
+            type=str(data.get("type", "")),
+            cleared_tool_uses=int(data.get("cleared_tool_uses") or 0),
+            cleared_input_tokens=int(data.get("cleared_input_tokens") or 0),
+        )
+
+
+class ContextEditsRejectedError(Exception):
+    """The provider rejected the requested server-side context edits.
+
+    Raised before any output was produced, so the caller can resend the same
+    request without them.
+    """
+
+
 @dataclass
 class NormalizedResponse:
     """Single-shot non-streaming response from a provider, normalized."""
@@ -51,6 +102,8 @@ class NormalizedResponse:
     stop_reason: StopReason
     usage: TokenUsage
     raw: Any = None
+    # Server-side context edits applied to this request's prompt.
+    applied_edits: list[AppliedEdit] = field(default_factory=list)
 
 
 class StreamChunkType(str, enum.Enum):
@@ -88,9 +141,16 @@ class BaseProviderAdapter(abc.ABC):
         Anthropic models reject sampling parameters with a 400).
       - `enable_caching` lets adapters apply provider-side prompt caching
         (no-op for providers that cache automatically).
+      - `context_edits` asks for server-side tool-result clearing. It is only
+        ever passed to an adapter whose `supports_tool_result_clearing` is
+        True, so adapters without the feature need not accept it. Such an
+        adapter reports what was applied in `NormalizedResponse.applied_edits`
+        (and in the `applied_edits` key of the USAGE/STOP stream chunks), and
+        raises `ContextEditsRejectedError` when the provider refuses the edits.
     """
 
     name: str = "base"
+    supports_tool_result_clearing: bool = False
 
     @abc.abstractmethod
     async def call(
@@ -105,6 +165,7 @@ class BaseProviderAdapter(abc.ABC):
         tool_choice: ToolChoice | None = None,
         enable_caching: bool = True,
         extra: dict[str, Any] | None = None,
+        context_edits: ToolResultClearing | None = None,
     ) -> NormalizedResponse: ...
 
     @abc.abstractmethod
@@ -120,6 +181,7 @@ class BaseProviderAdapter(abc.ABC):
         tool_choice: ToolChoice | None = None,
         enable_caching: bool = True,
         extra: dict[str, Any] | None = None,
+        context_edits: ToolResultClearing | None = None,
     ) -> AsyncIterator[StreamChunk]: ...
 
     @abc.abstractmethod

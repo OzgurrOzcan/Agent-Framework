@@ -18,7 +18,10 @@ Design laws enforced here:
     binds reasoning to the prefix (see `ProviderSpec.binds_reasoning_to_prefix`):
     the history is trimmed only at a run's first call there. A call that
     would not fit the window stops the run with CONTEXT_EXCEEDED *before*
-    it is sent, instead of surfacing the provider's 400.
+    it is sent, instead of surfacing the provider's 400. Where the provider
+    can clear old tool results server-side (Anthropic context editing), that
+    is requested on every call: it keeps long runs in bounds without editing
+    what was sent.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import contextlib
 import hashlib
 import json
 from dataclasses import dataclass, field
+from collections.abc import AsyncIterator
 from typing import Any, AsyncGenerator
 
 from agent_framework.core.config import AgentConfig
@@ -52,7 +56,16 @@ from agent_framework.core.policy import (
 from agent_framework.memory.short_term import ShortTermMemory
 from agent_framework.permissions.models import Verdict
 from agent_framework.permissions.resolver import PermissionResolver
-from agent_framework.providers.base import BaseProviderAdapter, StreamChunk, StreamChunkType
+from agent_framework.providers.base import (
+    AppliedEdit,
+    BaseProviderAdapter,
+    ContextEditsRejectedError,
+    NormalizedResponse,
+    StreamChunk,
+    StreamChunkType,
+    ToolResultClearing,
+)
+from agent_framework.tools.builtin.ask_user import ASK_USER_TOOL_NAME
 from agent_framework.tools.executor import ToolCancellationError, ToolExecutor
 from agent_framework.tools.models import ToolMetadata
 from agent_framework.tools.registry import ToolRegistry
@@ -152,6 +165,7 @@ class AgentLoop:
         trace: ExecutionTrace,
         agent_id: str,
         retain_history: bool = True,
+        native_clearing: bool = False,
     ) -> None:
         self.config = config
         self.provider = provider
@@ -168,6 +182,9 @@ class AgentLoop:
         # Editing already-sent messages mid-run would invalidate this model's
         # reasoning, so it is only trimmed at a run's first call.
         self._binds_reasoning = config.reasoning_binds_to_prefix
+        # Server-side tool-result clearing; switched off for the rest of the
+        # session if the provider rejects it once.
+        self.native_clearing = native_clearing
         # Concurrent runs would interleave into the same short-term memory.
         self._running = False
 
@@ -197,10 +214,20 @@ class AgentLoop:
             allow_trim=turn == 1 or not self._binds_reasoning,
         )
 
-    def _window_exceeded(self, estimated_tokens: int, turn_num: int) -> ContextWindowExceededError | None:
-        """The pre-flight guard: a prompt that cannot fit is never sent."""
+    def _window_exceeded(
+        self, estimated_tokens: int, turn_num: int
+    ) -> ContextWindowExceededError | None:
+        """The pre-flight guard: a prompt that cannot fit is never sent.
+
+        With server-side clearing on, the provider clears the old results
+        again on every call, so the amount it cleared last time does not
+        reach the model either.
+        """
         usable = self.config.usable_context_tokens
-        if estimated_tokens <= usable:
+        cleared = (
+            self.context.provider_cleared_tokens(self.short_term) if self.native_clearing else 0
+        )
+        if estimated_tokens - cleared <= usable:
             return None
         self.trace.record_event(
             EventType.LOOP_GUARD,
@@ -209,6 +236,7 @@ class AgentLoop:
             turn_number=turn_num,
             payload={
                 "estimated_tokens": estimated_tokens,
+                "cleared_by_provider": cleared,
                 "usable_tokens": usable,
                 "max_context_tokens": self.context.max_context_tokens,
             },
@@ -256,15 +284,87 @@ class AgentLoop:
             return None
         return policy.tool_choice
 
-    def _note_usage(self, usage: TokenUsage) -> float:
+    def _note_usage(self, usage: TokenUsage, applied_edits: list[AppliedEdit]) -> float:
         cost = self.cost.record(self.config.model, usage)
         ctx_actual = (
             usage.input_tokens
             + usage.cache_read_input_tokens
             + usage.cache_creation_input_tokens
         )
-        self.context.note_actual_tokens(ctx_actual)
+        cleared = 0
+        for edit in applied_edits:
+            cleared += edit.cleared_input_tokens
+            self.trace.record_event(
+                EventType.COMPACTION, name="native_clear", payload=edit.to_dict()
+            )
+        # The provider counted the prompt *after* clearing; calibrate against
+        # the prompt that was sent.
+        self.context.note_actual_tokens(ctx_actual, cleared_by_provider=cleared)
         return cost
+
+    # ---------- server-side tool-result clearing ----------
+
+    def _context_edits(self) -> ToolResultClearing | None:
+        if not self.native_clearing:
+            return None
+        limit = self.context.max_context_tokens
+        protected = {ASK_USER_TOOL_NAME} | {
+            t.metadata.name for t in self.tools if not t.metadata.clear_old_results
+        }
+        return ToolResultClearing(
+            trigger_tokens=limit,
+            keep_results=self.context.keep_recent_results(),
+            # Each clear rebuilds the prompt cache: only worth it in bulk.
+            clear_at_least_tokens=max(1, limit // 10),
+            exclude_tools=tuple(sorted(protected)),
+        )
+
+    def _disable_native_clearing(self, exc: ContextEditsRejectedError) -> None:
+        self.native_clearing = False
+        self.trace.record_event(
+            EventType.COMPACTION,
+            name="native_clear",
+            payload={"disabled": True, "reason": str(exc)[:500]},
+        )
+
+    async def _call_provider(self, **request: Any) -> NormalizedResponse:
+        """One provider call, with server-side clearing where available.
+
+        A rejection of the clearing (a gateway that drops the beta, a model
+        without it) is retried once without it and switches it off for the
+        rest of the session.
+        """
+        edits = self._context_edits()
+        if edits is None:
+            return await self.provider.call(**request)
+        try:
+            return await self.provider.call(**request, context_edits=edits)
+        except ContextEditsRejectedError as exc:
+            self._disable_native_clearing(exc)
+            return await self.provider.call(**request)
+
+    async def _stream_provider(self, **request: Any) -> AsyncGenerator[StreamChunk, None]:
+        """`_call_provider` for streaming. A rejection arrives before any
+        chunk, so the retry never duplicates output."""
+        edits = self._context_edits()
+        if edits is None:
+            async with _closing(self.provider.stream(**request)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+            return
+        started = False
+        try:
+            async with _closing(self.provider.stream(**request, context_edits=edits)) as chunks:
+                async for chunk in chunks:
+                    started = True
+                    yield chunk
+        except ContextEditsRejectedError as exc:
+            if started:
+                raise
+            self._disable_native_clearing(exc)
+            async with _closing(self.provider.stream(**request)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
 
     # ===================== non-streaming run =====================
 
@@ -347,7 +447,7 @@ class AgentLoop:
                         turn_number=turn_num,
                     ) as llm_span:
                         try:
-                            response = await self.provider.call(
+                            response = await self._call_provider(
                                 system=assembled.system_prompt,
                                 messages=assembled.messages,
                                 tools=[t.metadata for t in self.tools],
@@ -380,7 +480,7 @@ class AgentLoop:
                                 error=exc,
                                 trace=self.trace,
                             )
-                        cost = self._note_usage(response.usage)
+                        cost = self._note_usage(response.usage, response.applied_edits)
                         state.cumulative_cost_usd = self.cost.snapshot()[0]
                         llm_span.set_usage(response.usage, cost)
                         llm_span.update(
@@ -645,7 +745,7 @@ class AgentLoop:
                     turn_number=turn_num,
                 ) as llm_span:
                     try:
-                        async for chunk in self.provider.stream(
+                        provider_chunks = self._stream_provider(
                             system=assembled.system_prompt,
                             messages=assembled.messages,
                             tools=[t.metadata for t in self.tools],
@@ -655,51 +755,58 @@ class AgentLoop:
                             tool_choice=self._tool_choice_for_turn(policy, state.turn),
                             enable_caching=self.config.enable_prompt_caching,
                             extra=self.config.request_extra or None,
-                        ):
-                            yield chunk
-                            ctype = chunk.type
-                            if ctype == StreamChunkType.TEXT_DELTA:
-                                text_parts.append(chunk.payload.get("text", ""))
-                            elif ctype == StreamChunkType.TOOL_USE_COMPLETE:
-                                tool_calls_this_turn.append(
-                                    ToolCallRequest(
-                                        id=chunk.payload["id"],
-                                        name=chunk.payload["name"],
-                                        arguments=chunk.payload.get("arguments", {}),
-                                    )
-                                )
-                            elif ctype == StreamChunkType.USAGE:
-                                usage = TokenUsage(
-                                    input_tokens=chunk.payload.get("input_tokens", 0),
-                                    output_tokens=chunk.payload.get("output_tokens", 0),
-                                    cache_read_input_tokens=chunk.payload.get(
-                                        "cache_read_input_tokens", 0
-                                    ),
-                                    cache_creation_input_tokens=chunk.payload.get(
-                                        "cache_creation_input_tokens", 0
-                                    ),
-                                )
-                                cost = self._note_usage(usage)
-                                state.cumulative_cost_usd = self.cost.snapshot()[0]
-                                llm_span.set_usage(usage, cost)
-                            elif ctype == StreamChunkType.STOP:
-                                sr = chunk.payload.get("stop_reason", "end_turn")
-                                try:
-                                    stop_reason = StopReason(sr)
-                                except ValueError:
-                                    stop_reason = StopReason.END_TURN
-                                # Preserve reasoning/thinking blocks for round-trip:
-                                # Anthropic rejects the next tool-use turn if the
-                                # prior thinking block was stripped.
-                                for r in chunk.payload.get("reasoning") or []:
-                                    if isinstance(r, dict):
-                                        reasoning_blocks.append(
-                                            ReasoningContent(
-                                                provider=self.provider.name,  # type: ignore[arg-type]
-                                                raw=r,
-                                                text=r.get("thinking") or r.get("text"),
-                                            )
+                        )
+                        async with contextlib.aclosing(provider_chunks) as chunks:
+                            async for chunk in chunks:
+                                yield chunk
+                                ctype = chunk.type
+                                if ctype == StreamChunkType.TEXT_DELTA:
+                                    text_parts.append(chunk.payload.get("text", ""))
+                                elif ctype == StreamChunkType.TOOL_USE_COMPLETE:
+                                    tool_calls_this_turn.append(
+                                        ToolCallRequest(
+                                            id=chunk.payload["id"],
+                                            name=chunk.payload["name"],
+                                            arguments=chunk.payload.get("arguments", {}),
                                         )
+                                    )
+                                elif ctype == StreamChunkType.USAGE:
+                                    usage = TokenUsage(
+                                        input_tokens=chunk.payload.get("input_tokens", 0),
+                                        output_tokens=chunk.payload.get("output_tokens", 0),
+                                        cache_read_input_tokens=chunk.payload.get(
+                                            "cache_read_input_tokens", 0
+                                        ),
+                                        cache_creation_input_tokens=chunk.payload.get(
+                                            "cache_creation_input_tokens", 0
+                                        ),
+                                    )
+                                    edits = [
+                                        AppliedEdit.from_dict(e)
+                                        for e in chunk.payload.get("applied_edits") or []
+                                        if isinstance(e, dict)
+                                    ]
+                                    cost = self._note_usage(usage, edits)
+                                    state.cumulative_cost_usd = self.cost.snapshot()[0]
+                                    llm_span.set_usage(usage, cost)
+                                elif ctype == StreamChunkType.STOP:
+                                    sr = chunk.payload.get("stop_reason", "end_turn")
+                                    try:
+                                        stop_reason = StopReason(sr)
+                                    except ValueError:
+                                        stop_reason = StopReason.END_TURN
+                                    # Preserve reasoning/thinking blocks for round-trip:
+                                    # Anthropic rejects the next tool-use turn if the
+                                    # prior thinking block was stripped.
+                                    for r in chunk.payload.get("reasoning") or []:
+                                        if isinstance(r, dict):
+                                            reasoning_blocks.append(
+                                                ReasoningContent(
+                                                    provider=self.provider.name,  # type: ignore[arg-type]
+                                                    raw=r,
+                                                    text=r.get("thinking") or r.get("text"),
+                                                )
+                                            )
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -919,6 +1026,24 @@ class AgentLoop:
 
 
 # ---- pure helpers ----
+
+@contextlib.asynccontextmanager
+async def _closing(
+    chunks: AsyncIterator[StreamChunk],
+) -> AsyncGenerator[AsyncIterator[StreamChunk], None]:
+    """`contextlib.aclosing` for any adapter stream.
+
+    Closing promptly releases the provider's HTTP stream when the consumer
+    stops early. Adapters normally return async generators, but the
+    interface only promises an async iterator, which may have no `aclose`.
+    """
+    try:
+        yield chunks
+    finally:
+        aclose = getattr(chunks, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
 
 def _call_hash(tc: ToolCallRequest) -> str:
     canonical = json.dumps(tc.arguments, sort_keys=True, default=str, separators=(",", ":"))
