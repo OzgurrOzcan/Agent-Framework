@@ -16,6 +16,10 @@ is trimmed when it reaches `max_context_tokens`, and a tool result bigger than
 `max_tool_result_tokens` is cut when it arrives. Both default to values derived
 from the model's context window.
 
+An agent is stateless unless `memory` is set: every run starts from an empty
+history. `MemoryConfig()` keeps the conversation in RAM across runs;
+`MemoryConfig(store="app.db")` also keeps long-term memory in SQLite.
+
 Every setting lives in exactly one place. Tools, MCP, memory and permissions
 are wiring, not configuration, and are passed to `Agent(...)` directly.
 """
@@ -25,6 +29,7 @@ from __future__ import annotations
 import os
 import warnings
 from dataclasses import asdict, dataclass, field, fields, replace
+from pathlib import PurePath
 from typing import Any
 
 from agent_framework.providers.catalog import (
@@ -40,6 +45,7 @@ __all__ = [
     "DEFAULT_CONTEXT_WINDOW",
     "LOCAL_API_KEY_PLACEHOLDER",
     "AgentConfig",
+    "MemoryConfig",
     "TransportConfig",
 ]
 
@@ -98,6 +104,61 @@ class TransportConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    """Turns on conversation memory. Without one, every run starts fresh.
+
+        MemoryConfig()                                   # history kept in RAM
+        MemoryConfig(store="support.db", namespace="customer-42")   # + SQLite
+
+    `namespace`, `summarize` and `summary_model` describe long-term memory, so
+    they need a `store` (or a custom `Agent(memory_backend=...)`); `Agent`
+    rejects them without one rather than silently ignoring them.
+    """
+
+    # A SQLite file path → long-term memory. None = the history lives in RAM.
+    store: str | None = None
+    # Whose long-term memory this is: a user, a customer, a project.
+    namespace: str = "default"
+    # Long-term: summarize the turns a trim removes (one LLM call per trim).
+    summarize: bool = True
+    # Long-term: a cheaper model of the same provider for those summaries.
+    # None = the agent's own model.
+    summary_model: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.store, PurePath):
+            object.__setattr__(self, "store", str(self.store))
+        _require(
+            self.store is None or (isinstance(self.store, str) and self.store.strip() != ""),
+            f"MemoryConfig.store must be a non-empty path or None, got {self.store!r}",
+        )
+        _require(
+            isinstance(self.namespace, str) and self.namespace.strip() != "",
+            f"MemoryConfig.namespace must be a non-empty string, got {self.namespace!r}",
+        )
+        _require(
+            isinstance(self.summarize, bool),
+            f"MemoryConfig.summarize must be a bool, got {self.summarize!r}",
+        )
+        _require(
+            self.summary_model is None
+            or (isinstance(self.summary_model, str) and self.summary_model.strip() != ""),
+            f"MemoryConfig.summary_model must be a model id or None, got {self.summary_model!r}",
+        )
+
+    def long_term_settings(self) -> list[str]:
+        """The long-term-only fields that were changed from their defaults."""
+        changed = []
+        if self.namespace != "default":
+            changed.append("namespace")
+        if self.summarize is not True:
+            changed.append("summarize")
+        if self.summary_model is not None:
+            changed.append("summary_model")
+        return changed
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     """Everything that configures one agent. Frozen, validated, serializable.
 
@@ -140,6 +201,9 @@ class AgentConfig:
     # `@tool(max_result_tokens=...)` overrides it per tool. None = the smallest
     # of 16k, 10 % of the window and a fifth of max_context_tokens.
     max_tool_result_tokens: int | None = None
+    # None = stateless: every run starts from an empty history. A
+    # MemoryConfig keeps the conversation (see MemoryConfig).
+    memory: MemoryConfig | None = None
     transport: TransportConfig = field(default_factory=TransportConfig)
     environment: dict[str, str] = field(default_factory=dict)
     # Duplicate tool descriptions into the system prompt (<capabilities>
@@ -215,6 +279,12 @@ class AgentConfig:
             self.max_parallel_tools >= 1,
             f"max_parallel_tools must be >= 1, got {self.max_parallel_tools}",
         )
+        if self.memory is not None and not isinstance(self.memory, MemoryConfig):
+            raise TypeError(
+                "memory must be a MemoryConfig or None, got "
+                f"{type(self.memory).__name__}. A custom long-term backend is "
+                "passed as Agent(..., memory_backend=...)."
+            )
         # An unrecognized model silently inherits the provider's fallback
         # window. Budgeting a locally served 8k model as 200k means trimming
         # never fires and the endpoint rejects the overflow instead.
@@ -361,7 +431,7 @@ class AgentConfig:
                 f"Unknown AgentConfig field(s): {', '.join(sorted(unknown))}. "
                 f"Valid fields: {', '.join(sorted(known))}."
             )
-        nested = {"transport": TransportConfig}
+        nested = {"transport": TransportConfig, "memory": MemoryConfig}
         for key, factory in nested.items():
             value = payload.get(key)
             if isinstance(value, dict):
@@ -374,7 +444,7 @@ class AgentConfig:
 
         Reads the flat scalar fields only — `{prefix}MODEL`,
         `{prefix}SYSTEM_PROMPT`, `{prefix}MAX_TURNS`, and so on. The nested
-        `transport` record and the dict-valued fields are not
+        `transport` / `memory` records and the dict-valued fields are not
         env-configurable; pass them via *overrides*, which win over the
         environment. Empty variables are treated as unset, and a value that
         does not parse raises rather than falling back to the default.

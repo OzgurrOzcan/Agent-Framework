@@ -4,7 +4,7 @@ Public API entry points:
 
     from agent_framework import Agent, AgentConfig, tool, PermissionCategory
     from agent_framework import PermissionConfig, AllowRule, DenyRule
-    from agent_framework import ToolRegistry, MemoryManager
+    from agent_framework import ToolRegistry, MemoryConfig
     from agent_framework import TerminalRenderer, CallbackRenderer, HeadlessRenderer
 
 The model id names its own provider, so the common case needs no provider
@@ -13,7 +13,7 @@ argument at all:
     agent = Agent("claude-opus-5", system_prompt="...", tools=[my_tool])
 """
 
-from agent_framework.core.config import AgentConfig, TransportConfig
+from agent_framework.core.config import AgentConfig, MemoryConfig, TransportConfig
 from agent_framework.core.message import (
     Message,
     UserMessage,
@@ -61,6 +61,7 @@ from agent_framework.tracing.cost import CostTracker, PricingTable
 __all__ = [
     "Agent",
     "AgentConfig",
+    "MemoryConfig",
     "TransportConfig",
     "ProviderSpec",
     "ProviderResolutionError",

@@ -87,6 +87,13 @@ PROTECTED_RESULT_TOKENS = 64
 MIN_TRIM_HEADROOM = 0.10
 
 _CALIBRATION_BOUNDS = (0.5, 4.0)
+# A reported prompt size this far from the estimate does not describe the
+# prompt that was sent (a proxy reporting placeholder usage, a provider
+# counting something else). chars/4 is rough, but not off by more than this
+# — even dense CJK text or highly repetitive output stays within it. Such a
+# sample is ignored: trusting it would anchor every later estimate on noise
+# and silently stop the trim from firing.
+_PLAUSIBLE_RATIO = (0.2, 10.0)
 
 
 @dataclass(frozen=True)
@@ -304,12 +311,13 @@ class ContextManager:
         the next call's estimate.
         """
         pending = self._pending
-        if actual_input_tokens <= 0 or pending is None:
+        if actual_input_tokens <= 0 or pending is None or pending.raw_total <= 0:
             return
-        if pending.raw_total > 0:
-            ratio = actual_input_tokens / pending.raw_total
-            low, high = _CALIBRATION_BOUNDS
-            self._calibration = min(high, max(low, 0.8 * self._calibration + 0.2 * ratio))
+        ratio = actual_input_tokens / pending.raw_total
+        if not _PLAUSIBLE_RATIO[0] <= ratio <= _PLAUSIBLE_RATIO[1]:
+            return
+        low, high = _CALIBRATION_BOUNDS
+        self._calibration = min(high, max(low, 0.8 * self._calibration + 0.2 * ratio))
         self._anchor = _Anchor(
             epoch=pending.epoch,
             view_len=pending.view_len,

@@ -1,7 +1,8 @@
 """AgentLoop — the core Observe → Reason → Act → Observe while-loop.
 
 Design laws enforced here:
-  - Messages are the only durable state.
+  - Messages are the only durable state. Without memory (the default) a
+    run starts from an empty history; with it, the history carries over.
   - Errors are feedback, never crashes (denials, timeouts, exceptions,
     provider failures all become `ToolResult(is_error=True)` or an
     `AgentResult(error=...)` — never an unhandled traceback).
@@ -103,7 +104,9 @@ class AgentResult:
         return []
 
 
-def _policy_payload(policy: LoopPolicy, *, streaming: bool) -> dict[str, Any]:
+def _policy_payload(
+    policy: LoopPolicy, *, streaming: bool, retain_history: bool
+) -> dict[str, Any]:
     """The effective shape of one run, for the RUN span.
 
     `AgentConfig` records the defaults, but `run(max_turns=3)` overrides them
@@ -121,6 +124,8 @@ def _policy_payload(policy: LoopPolicy, *, streaming: bool) -> dict[str, Any]:
         "tool_choice": choice.mode if choice is not None else None,
         "tool_choice_name": choice.tool_name if choice is not None else None,
         "streaming": streaming,
+        # False = this run started from an empty history (no memory).
+        "retain_history": retain_history,
     }
 
 
@@ -140,6 +145,7 @@ class AgentLoop:
         cost_tracker: CostTracker,
         trace: ExecutionTrace,
         agent_id: str,
+        retain_history: bool = True,
     ) -> None:
         self.config = config
         self.provider = provider
@@ -151,6 +157,8 @@ class AgentLoop:
         self.cost = cost_tracker
         self.trace = trace
         self.agent_id = agent_id
+        # False = stateless: each run starts from an empty history.
+        self.retain_history = retain_history
         # Concurrent runs would interleave into the same short-term memory.
         self._running = False
 
@@ -162,6 +170,39 @@ class AgentLoop:
                 "separate agent for parallel work."
             )
         self._running = True
+
+    def _begin_run(self, user_input: str) -> None:
+        """Start a run's history: fresh without memory, repaired with it."""
+        if not self.retain_history:
+            self.short_term.clear()
+        else:
+            self._answer_unanswered_calls()
+        self.short_term.append(UserMessage(content=user_input))
+
+    def _answer_unanswered_calls(self) -> None:
+        """Give tool calls left without results a result before going on.
+
+        `complete()` returns tool calls as data without running them, and a
+        response cut off by the context window can end in one. Sending such a
+        call again without its result is rejected by every provider, so a
+        remembered conversation would fail on its next run.
+        """
+        last = self.short_term.last
+        if not isinstance(last, AssistantMessage) or not last.tool_calls:
+            return
+        self.short_term.append(
+            ToolResultMessage(
+                content=[
+                    ToolResult(
+                        tool_use_id=tc.id,
+                        name=tc.name,
+                        content="Not executed: this tool call was never run.",
+                        is_error=True,
+                    )
+                    for tc in last.tool_calls
+                ]
+            )
+        )
 
     def _tool_choice_for_turn(self, policy: LoopPolicy, turn: int):
         # A forced tool choice only applies to the first LLM call — repeating
@@ -197,7 +238,9 @@ class AgentLoop:
             with self.trace.start_span(
                 EventType.RUN,
                 name="run",
-                payload=_policy_payload(policy, streaming=False),
+                payload=_policy_payload(
+                    policy, streaming=False, retain_history=self.retain_history
+                ),
             ) as run_span:
                 result = await self._run_inner(user_input, policy=policy)
                 run_span.update(
@@ -221,7 +264,7 @@ class AgentLoop:
         policy: LoopPolicy,
     ) -> AgentResult:
         state = LoopState()
-        self.short_term.append(UserMessage(content=user_input))
+        self._begin_run(user_input)
 
         stop_reason = StopReason.END_TURN
         try:
@@ -468,7 +511,9 @@ class AgentLoop:
             with self.trace.start_span(
                 EventType.RUN,
                 name="run",
-                payload=_policy_payload(policy, streaming=True),
+                payload=_policy_payload(
+                    policy, streaming=True, retain_history=self.retain_history
+                ),
             ) as run_span:
                 try:
                     # aclosing: if our consumer closes the stream early, close
@@ -514,7 +559,7 @@ class AgentLoop:
         policy: LoopPolicy,
         state: LoopState,
     ) -> AsyncGenerator[StreamChunk, None]:
-        self.short_term.append(UserMessage(content=user_input))
+        self._begin_run(user_input)
 
         try:
             while True:

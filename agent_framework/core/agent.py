@@ -10,6 +10,12 @@ variant is a one-liner and nothing has to be rebuilt by hand:
 
     summarizer = Agent(base_config, system_prompt="Summarize.", max_turns=2)
 
+An agent is stateless by default: every run starts from an empty history.
+`memory=MemoryConfig()` keeps the conversation across runs (in RAM), and
+`MemoryConfig(store="app.db")` adds long-term memory in SQLite:
+
+    chat = Agent("claude-opus-5", memory=MemoryConfig())
+
 The execution surface is deliberately small — two mental models, one method
 each:
 
@@ -37,7 +43,7 @@ from collections.abc import AsyncGenerator, Iterable
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from agent_framework.core.config import AgentConfig
+from agent_framework.core.config import AgentConfig, MemoryConfig
 from agent_framework.core.context_manager import ContextManager
 from agent_framework.core.loop import AgentLoop, AgentResult
 from agent_framework.core.message import AnyMessage, message_from_dict
@@ -45,6 +51,9 @@ from agent_framework.core.policy import LoopPolicy
 from agent_framework.interrupts.manager import InterruptManager
 from agent_framework.interrupts.renderers.base import UIRenderer
 from agent_framework.mcp.registry import MCPServerRegistry
+from agent_framework.memory.backends.base import LongTermBackend
+from agent_framework.memory.backends.sqlite import SQLiteBackend
+from agent_framework.memory.long_term import LongTermMemory
 from agent_framework.memory.manager import MemoryManager
 from agent_framework.memory.short_term import ContextState
 from agent_framework.permissions.config import PermissionConfig
@@ -87,6 +96,8 @@ _CONFIG_OVERRIDES = (
     # Pairs with base_url: a self-hosted endpoint's window is not in the
     # catalog, and getting it wrong means trimming never fires.
     "context_window",
+    # None (the default) = stateless; a MemoryConfig keeps the conversation.
+    "memory",
 )
 
 
@@ -105,11 +116,13 @@ class Agent:
         api_key: str | None = _UNSET,
         base_url: str | None = _UNSET,
         context_window: int | None = _UNSET,
+        memory: MemoryConfig | None = _UNSET,
         # --- wiring ---
         tools: ToolRegistry | Iterable[Tool] | None = None,
         permissions: PermissionConfig | None = None,
         mcp: MCPServerRegistry | None = None,
-        memory: MemoryManager | None = None,
+        memory_backend: LongTermBackend | None = None,
+        session_id: str | None = None,
         trace: ExecutionTrace | None = None,
         pricing: PricingTable | None = None,
         agent_id: str | None = None,
@@ -125,9 +138,11 @@ class Agent:
             config: a model id (``"claude-opus-5"``, ``"openai:llama-3.3-70b"``)
                 or an `AgentConfig`.
             system_prompt, max_turns, max_budget_usd, temperature, api_key,
-                base_url, context_window: override the corresponding
+                base_url, context_window, memory: override the corresponding
                 `AgentConfig` field. Anything not listed here is set on an
-                `AgentConfig` instead.
+                `AgentConfig` instead. `memory=None` (the default) makes the
+                agent stateless; `memory=MemoryConfig(...)` keeps the
+                conversation.
             tools: `Tool` objects (from `@tool`) or a `ToolRegistry`. Copied,
                 so a registry shared between agents is never mutated.
             permissions: rules and the renderer that answers `ASK` prompts.
@@ -135,7 +150,12 @@ class Agent:
                 deferred to the first run, and a failing server is recorded in
                 the trace and skipped. Use `await Agent.connect(...)` to
                 discover eagerly and raise on any failure instead.
-            memory, trace, pricing: injected subsystems; sensible defaults are
+            memory_backend: a custom long-term backend instead of SQLite
+                (advanced). Requires `memory=MemoryConfig(...)` without a
+                `store`.
+            session_id: which conversation this agent saves and resumes.
+                Defaults to a fresh id per agent; it is recorded in the trace.
+            trace, pricing: injected subsystems; sensible defaults are
                 built when omitted.
             agent_id: stable id for traces; generated when omitted.
             parent_permissions: when building a sub-agent, the parent's
@@ -153,7 +173,11 @@ class Agent:
             api_key=api_key,
             base_url=base_url,
             context_window=context_window,
+            memory=memory,
         )
+        _validate_memory(self.config.memory, memory_backend)
+        if session_id is not None and (not isinstance(session_id, str) or not session_id.strip()):
+            raise ValueError(f"session_id must be a non-empty string, got {session_id!r}")
 
         # Copy the tools: registering `ask_user` (and later the MCP tools)
         # must not reach into a registry the caller may share between agents.
@@ -179,7 +203,11 @@ class Agent:
         self._trace = trace or ExecutionTrace(agent_id=self.agent_id)
         self._cost = CostTracker(pricing=pricing or PricingTable.default())
         self._tools = registry
-        self._memory = memory or MemoryManager()
+        # Never the trace's id: two agents may share one trace, and must not
+        # share — and interleave — one conversation.
+        self.session_id = session_id or f"sess_{uuid.uuid4().hex[:16]}"
+        self._memory_backend = memory_backend
+        self._memory = _build_memory(self.config.memory, memory_backend)
         self._permissions_cfg = perms
         self._renderer = renderer
         self._provider = provider if provider is not None else _build_provider(self.config)
@@ -205,12 +233,12 @@ class Agent:
             perms,
             interrupt_manager=self._interrupts,
             trace=self._trace,
-            session_id=self._trace.session_id,
+            session_id=self.session_id,
         )
         self._executor = ToolExecutor(
             trace=self._trace,
             interrupt_manager=self._interrupts,
-            session_id=self._trace.session_id,
+            session_id=self.session_id,
             max_parallel=self.config.max_parallel_tools,
             default_max_result_tokens=self.config.resolved_max_tool_result_tokens,
         )
@@ -241,6 +269,7 @@ class Agent:
             cost_tracker=self._cost,
             trace=self._trace,
             agent_id=self.agent_id,
+            retain_history=self.config.memory is not None,
         )
 
     # ===================== async construction =====================
@@ -386,9 +415,11 @@ class Agent:
 
     # ===================== inspection =====================
     def get_history(self) -> list[AnyMessage]:
+        """The stored conversation. Without memory: the last run's messages."""
         return self._memory.short_term.snapshot()
 
     def clear_history(self) -> None:
+        """Forget the conversation (messages and context state)."""
         self._memory.short_term.clear()
 
     def get_trace(self) -> ExecutionTrace:
@@ -480,6 +511,15 @@ class Agent:
             # silently disables max_budget_usd — worth knowing per run.
             pricing_resolved=self._cost.pricing.get(self.config.model) is not None,
             framework_version=_framework_version(),
+            # The conversation this agent saves and resumes. Not the span's
+            # own `session_id`, which is the trace's.
+            session_id=self.session_id,
+            retain_history=self.config.memory is not None,
+            memory_backend=(
+                type(self._memory_backend).__name__
+                if self._memory_backend is not None
+                else None
+            ),
         )
         self._trace.record_event(EventType.SESSION, name="session", payload=payload)
 
@@ -553,6 +593,55 @@ def _resolve_config(config: str | AgentConfig, **overrides: Any) -> AgentConfig:
             f"{type(config).__name__}."
         )
     return config.replace(**supplied) if supplied else config
+
+
+def _validate_memory(memory: MemoryConfig | None, backend: LongTermBackend | None) -> None:
+    """Reject memory settings that would silently do nothing.
+
+    Lives here, not in `MemoryConfig`: whether long-term memory exists depends
+    on `memory_backend`, which is wiring and never part of a config.
+    """
+    if backend is not None:
+        if not isinstance(backend, LongTermBackend):
+            raise TypeError(
+                "memory_backend must be a LongTermBackend, got "
+                f"{type(backend).__name__}."
+            )
+        if memory is None:
+            raise ValueError(
+                "memory_backend= needs memory=MemoryConfig(...): an agent is "
+                "stateless unless memory is turned on."
+            )
+        if memory.store is not None:
+            raise ValueError(
+                "Pass either MemoryConfig(store=...) or memory_backend=, not "
+                "both: each one is the long-term store."
+            )
+        return
+    if memory is not None and memory.store is None:
+        unused = memory.long_term_settings()
+        if unused:
+            raise ValueError(
+                f"MemoryConfig.{', MemoryConfig.'.join(unused)} only apply to "
+                "long-term memory: also set MemoryConfig(store='<file>.db') or "
+                "pass memory_backend=."
+            )
+
+
+def _build_memory(
+    memory: MemoryConfig | None, backend: LongTermBackend | None
+) -> MemoryManager:
+    """The agent's memory: short-term always, long-term when configured."""
+    if memory is None:
+        return MemoryManager()
+    if backend is None and memory.store is not None:
+        backend = SQLiteBackend(memory.store)
+    long_term = (
+        LongTermMemory(backend=backend, namespace=memory.namespace)
+        if backend is not None
+        else None
+    )
+    return MemoryManager(long_term=long_term)
 
 
 def _build_provider(config: AgentConfig) -> BaseProviderAdapter:

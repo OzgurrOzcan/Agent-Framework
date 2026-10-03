@@ -85,6 +85,7 @@ class MockLLMProvider(BaseProviderAdapter):
         turn = self._next_turn()
         self.call_log.append({
             "system": system[:100],
+            "messages": list(messages),
             "message_count": len(messages),
             "tool_count": len(tools),
             "temperature": temperature,

@@ -13,7 +13,7 @@ import random
 import pytest
 
 from agent_framework.core.agent import Agent
-from agent_framework.core.config import AgentConfig
+from agent_framework.core.config import AgentConfig, MemoryConfig
 from agent_framework.core.context_manager import (
     CLEAR_NOTE,
     ContextManager,
@@ -293,12 +293,13 @@ async def test_estimate_is_anchored_and_reset_on_replace():
     mgr = _mgr()
     memory = _memory(UserMessage(content="hello " * 100))
     await mgr.assemble(memory)
-    mgr.note_actual_tokens(5_000)  # the provider's count disagrees with chars/4
+    mgr.note_actual_tokens(300)  # the provider counts ≈2x what chars/4 says
 
     appended = AssistantMessage(content="z" * 400)
     memory.append(appended)
     view = mgr.render_view(memory.snapshot(), memory.state)
-    expected = 5_000 + int(estimate_message_tokens(appended) * mgr.calibration)
+    expected = 300 + int(estimate_message_tokens(appended) * mgr.calibration)
+    assert mgr.calibration > 1.0
     assert mgr.estimate(memory, view) == expected
 
     # Any history replacement invalidates the anchor.
@@ -411,7 +412,9 @@ def test_checkpoint_restores_the_context_state():
 
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_loop_applies_the_trim(streaming):
-    agent, mock = _priced_agent(max_context_tokens=2_000, max_tool_result_tokens=200)
+    agent, mock = _priced_agent(
+        max_context_tokens=2_000, max_tool_result_tokens=200, memory=MemoryConfig()
+    )
     mock.add_turn(ScriptedTurn(text="done"))
     for i in range(10):
         agent.memory.short_term.extend(_turn(i, answer_chars=1_000))

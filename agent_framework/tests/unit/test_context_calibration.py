@@ -56,8 +56,20 @@ async def test_calibration_adjusts_toward_actual():
     assert mgr.calibration > first
     # Factor is clamped.
     for _ in range(50):
-        mgr.note_actual_tokens(est * 100)
-    assert mgr.calibration <= 4.0
+        mgr.note_actual_tokens(est * 9)
+    assert mgr.calibration == 4.0
+
+
+async def test_implausible_usage_is_ignored():
+    """A proxy reporting placeholder usage must not anchor every later estimate."""
+    mgr = _mgr()
+    memory = _memory(UserMessage(content="hello world " * 500))
+    await mgr.assemble(memory)
+    est = mgr._pending.raw_total
+    mgr.note_actual_tokens(10)  # far too small to describe this prompt
+    mgr.note_actual_tokens(est * 50)  # far too large
+    assert mgr.calibration == 1.0
+    assert mgr._anchor is None
 
 
 async def test_calibration_ignores_zero_usage():
