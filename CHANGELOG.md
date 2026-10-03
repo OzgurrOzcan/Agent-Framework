@@ -68,6 +68,11 @@ Other behaviour changes:
 - **Tool calls without results are answered.** A remembered conversation in
   which `complete()` returned tool calls unexecuted no longer fails on the next
   run: they get a "not executed" result first.
+- **A remembered run that fails before any reply leaves no trace.** If the
+  prompt would not fit or the provider rejects it, the run's input is taken
+  back out of the history (`input_rolled_back` on the run span), so one
+  oversized message cannot make every later run fail. A run the caller stops
+  keeps its input.
 - `Agent(session_id=...)` defaults to a fresh id per agent, never the trace's,
   and is what permission prompts and `ask_user` report.
 

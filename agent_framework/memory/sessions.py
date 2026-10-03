@@ -20,14 +20,17 @@ load once before the first run, flush after every run.
 from __future__ import annotations
 
 import abc
+import asyncio
 import hashlib
 import json
-from collections.abc import Iterable
+from collections.abc import Awaitable, Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 from agent_framework.core.message import AnyMessage, message_from_dict
 from agent_framework.memory.short_term import LOG_SEQ_KEY, ContextState, ShortTermMemory
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -104,11 +107,17 @@ class SessionStore(abc.ABC):
         text: str,
         *,
         session_id: str | None = None,
+        expected_upto: int | None = None,
         summarized_upto: int = 0,
-    ) -> None:
+    ) -> bool:
         """Append a segment and, in the same transaction, advance *session_id*'s
         `summarized_upto` to at least *summarized_upto* — so a crash can never
-        leave a summary whose messages still look unsummarized."""
+        leave a summary whose messages still look unsummarized.
+
+        With *expected_upto*, nothing is written (False) if the session's
+        stored marker is no longer that value: another session summarized
+        part of this one meanwhile, and appending would cover it twice.
+        """
 
     @abc.abstractmethod
     async def merge_summaries(
@@ -156,6 +165,37 @@ def tool_set_fingerprint(system_prompt: str, tools: Iterable[Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
+async def run_to_end(write: Awaitable[T]) -> tuple[T, bool]:
+    """Await a store write to its end, even if the caller is cancelled meanwhile.
+
+    A write keeps running when the task awaiting it is cancelled (SQLite's runs
+    in a worker thread that cannot be interrupted), so the caller must learn
+    how it ended before deciding anything: a write that committed must not be
+    treated as lost. Returns ``(result, cancelled)`` — a caller told
+    ``cancelled=True`` does its bookkeeping and then re-raises
+    `CancelledError`. If the write failed and the caller was cancelled, the
+    cancellation is raised (from the write's error), never swallowed.
+    """
+    task = asyncio.ensure_future(write)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                break
+            cancelled = True  # the write runs on: keep waiting for it
+        except BaseException:
+            break
+    try:
+        result = task.result()
+    except BaseException as exc:
+        if cancelled:
+            raise asyncio.CancelledError() from exc
+        raise
+    return result, cancelled
+
+
 class ConversationSession:
     """One agent's conversation in a `SessionStore`."""
 
@@ -168,6 +208,11 @@ class ConversationSession:
         self._created_at = ""
         # Entries numbered before the next flush (see assign_seqs).
         self._pending_log: list[LogEntry] = []
+        # Saves are numbered from `_next_seq`: two at once would reuse numbers.
+        self._flush_lock = asyncio.Lock()
+        # Set when the stored session could not be read: this agent's numbers
+        # and marker are then meaningless, so nothing may be written for it.
+        self.broken = False
 
     @property
     def summarized_upto(self) -> int:
@@ -176,6 +221,13 @@ class ConversationSession:
 
     def mark_summarized(self, upto: int) -> None:
         self._summarized_upto = max(self._summarized_upto, upto)
+
+    async def refresh_marker(self) -> None:
+        """Re-read `summarized_upto`: another session may have advanced it
+        (by summarizing this one's tail while it sat idle)."""
+        record = await self.store.load_session(self.namespace, self.session_id)
+        if record is not None:
+            self.mark_summarized(record.summarized_upto)
 
     def assign_seqs(self, messages: Iterable[AnyMessage]) -> None:
         """Give *messages* their log numbers now (in order) instead of at flush.
@@ -210,46 +262,64 @@ class ConversationSession:
             state.reasoning_cut = len(history)
             dropped = True
         memory.replace_all(history, state=state)
-        self._next_seq = record.last_seq + 1
-        self._summarized_upto = record.summarized_upto
-        self._created_at = record.created_at
+        self._adopt(record)
         return True, dropped
+
+    async def load_counters(self) -> None:
+        """Continue the stored session's numbering without restoring its history
+        (for a conversation cleared before it was ever loaded)."""
+        record = await self.store.load_session(self.namespace, self.session_id)
+        if record is not None:
+            self._adopt(record)
+
+    def _adopt(self, record: SessionRecord) -> None:
+        self._next_seq = max(self._next_seq, record.last_seq + 1)
+        self.mark_summarized(record.summarized_upto)
+        self._created_at = record.created_at
 
     async def flush(self, memory: ShortTermMemory, fingerprint: str) -> int:
         """Log what is new and save the current state; returns entries logged.
 
-        Messages are numbered tentatively: if the save fails (or is
-        cancelled) the numbers are taken back, so the next flush logs the
-        same messages again instead of skipping them as already logged.
+        Messages are numbered tentatively: if the save fails the numbers are
+        taken back, so the next flush logs the same messages again instead of
+        skipping them as already logged. A save interrupted by cancellation is
+        awaited to its end first, so one that committed keeps its numbers.
         """
-        seq = self._next_seq
-        stamped: list[AnyMessage] = []
-        new_log = list(self._pending_log)
-        try:
-            for message in [*memory.unlogged_dropped(), *memory.snapshot()]:
-                if LOG_SEQ_KEY in message.metadata:
-                    continue
-                message.metadata[LOG_SEQ_KEY] = seq
-                stamped.append(message)
-                new_log.append(LogEntry(seq=seq, message=message.to_dict()))
-                seq += 1
-            record = SessionRecord(
-                history=[m.to_dict() for m in memory.snapshot()],
-                state=memory.state.to_dict(),
-                last_seq=seq - 1,
-                fingerprint=fingerprint,
-                summarized_upto=self._summarized_upto,
-                created_at=self._created_at,
-            )
-            await self.store.save_session(self.namespace, self.session_id, record, new_log)
-        except BaseException:
-            for message in stamped:
-                message.metadata.pop(LOG_SEQ_KEY, None)
-            raise
-        self._next_seq = seq
-        self._pending_log = []
-        memory.forget_logged_dropped()
-        return len(new_log)
+        if self.broken:
+            raise RuntimeError("the stored session could not be read; not saving over it")
+        async with self._flush_lock:
+            seq = self._next_seq
+            stamped: list[AnyMessage] = []
+            new_log = list(self._pending_log)
+            try:
+                for message in [*memory.unlogged_dropped(), *memory.snapshot()]:
+                    if LOG_SEQ_KEY in message.metadata:
+                        continue
+                    message.metadata[LOG_SEQ_KEY] = seq
+                    stamped.append(message)
+                    new_log.append(LogEntry(seq=seq, message=message.to_dict()))
+                    seq += 1
+                record = SessionRecord(
+                    history=[m.to_dict() for m in memory.snapshot()],
+                    state=memory.state.to_dict(),
+                    last_seq=seq - 1,
+                    fingerprint=fingerprint,
+                    summarized_upto=self._summarized_upto,
+                    created_at=self._created_at,
+                )
+                _, cancelled = await run_to_end(
+                    self.store.save_session(self.namespace, self.session_id, record, new_log)
+                )
+            except BaseException:
+                for message in stamped:
+                    message.metadata.pop(LOG_SEQ_KEY, None)
+                raise
+            self._next_seq = seq
+            self._pending_log = []
+            memory.forget_logged_dropped()
+            if cancelled:
+                raise asyncio.CancelledError()
+            return len(new_log)
 
 
 def log_seq(message: AnyMessage) -> int | None:

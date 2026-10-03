@@ -279,6 +279,8 @@ class Agent:
         self._session = _build_session(self.config.memory, self._memory, self.session_id)
         self._session_ready = self._session is None
         self._session_lock = asyncio.Lock()
+        # With a log to write, messages leaving the history unlogged are held.
+        self._memory.short_term.track_unlogged = self._session is not None
         # Long-term summaries live next to the sessions they come from.
         self._summarizer = (
             Summarizer(
@@ -288,6 +290,8 @@ class Agent:
                 cost=self._cost,
                 trace=self._trace,
                 auto=self.config.memory.summarize if self.config.memory else False,
+                # The summary heads every new conversation; no trim removes it.
+                budget_tokens=self.config.resolved_max_context_tokens // 5,
             )
             if self._session is not None
             else None
@@ -304,6 +308,7 @@ class Agent:
             binds_reasoning=self.config.reasoning_binds_to_prefix,
             model=self.config.model,
             summarizer=self._summarizer,
+            usable_tokens=self.config.usable_context_tokens,
         )
         self._checkpoints: dict[CheckpointId, dict[str, Any]] = {}
         self._native_clearing = _native_clearing_available(self.config, self._provider)
@@ -504,7 +509,14 @@ class Agent:
         With a store, the emptied conversation is saved too, so resuming the
         same session_id later starts from nothing rather than the old history.
         """
+        await self._ensure_mcp()  # the saved fingerprint covers the MCP tools
         async with self._session_lock:
+            if not self._session_ready and self._session is not None:
+                # Never loaded: continue its log numbering, but not its history.
+                try:
+                    await self._session.load_counters()
+                except Exception as exc:
+                    self._session_unreadable(exc)
             # Never load the old conversation after this.
             self._session_ready = True
         self._memory.short_term.clear()
@@ -561,7 +573,10 @@ class Agent:
         when there is nothing new). False without long-term summaries."""
         if self._summarizer is None:
             return False
+        await self._ensure_mcp()  # the session fingerprint covers the MCP tools
         await self._ensure_session()
+        if self._session is None:  # it could not be read: nothing to summarize safely
+            return False
         await self._flush_session()
         return await self._summarizer.summarize_session()
 
@@ -586,14 +601,7 @@ class Agent:
                     self._memory.short_term, self._fingerprint()
                 )
             except Exception as exc:
-                self._session = None
-                self._trace.record_event(
-                    EventType.ERROR,
-                    name="session_load_failed",
-                    status=SpanStatus.ERROR,
-                    payload={"session_id": self.session_id},
-                    error=ErrorInfo.from_exception(exc),
-                )
+                self._session_unreadable(exc)
             else:
                 self._trace.record_event(
                     EventType.MEMORY_READ,
@@ -608,6 +616,23 @@ class Agent:
                     },
                 )
             self._session_ready = True
+
+    def _session_unreadable(self, exc: BaseException) -> None:
+        """The stored session could not be read: write nothing for it again.
+
+        Its numbering and summary marker are unknown, so saving or summarizing
+        would overwrite or double-count what the store holds.
+        """
+        if self._session is not None:
+            self._session.broken = True  # the summarizer holds it too
+        self._session = None
+        self._trace.record_event(
+            EventType.ERROR,
+            name="session_load_failed",
+            status=SpanStatus.ERROR,
+            payload={"session_id": self.session_id},
+            error=ErrorInfo.from_exception(exc),
+        )
 
     async def _flush_session(self) -> None:
         """Save the conversation after a run. Failures are traced, not raised."""

@@ -392,3 +392,114 @@ class FactsOnly(LongTermBackend):
 def test_a_backend_without_sessions_warns():
     with pytest.warns(UserWarning, match="SessionStore"):
         Agent("claude-haiku-4-5", api_key="k", memory=MemoryConfig(), memory_backend=FactsOnly())
+
+
+# ---------------- review regressions: numbering, cancellation, failures ----------------
+
+async def _log_contents(agent, session_id="ticket-1"):
+    log = await agent.memory.long_term.backend.session_log("default", session_id)
+    return [e.seq for e in log], [str(e.message["content"]) for e in log]
+
+
+async def test_clearing_before_the_first_run_continues_the_numbering(tmp_path):
+    """The stored log already holds 1..N; a fresh numbering would collide."""
+    db = tmp_path / "m.db"
+    first, _ = make_agent(db, [ScriptedTurn(text="one")])
+    await first.run("q1")
+    await first.memory.close()
+
+    second, _ = make_agent(db, [ScriptedTurn(text="two")])
+    await second.clear_history()
+    await second.run("q2")
+
+    assert events(second, EventType.ERROR, "session_save_failed") == []
+    seqs, texts = await _log_contents(second)
+    assert seqs == [1, 2, 3, 4] and texts[2:] == ["q2", "two"]
+    await second.memory.close()
+
+
+async def test_a_save_interrupted_by_cancellation_keeps_its_numbers(tmp_path):
+    """The SQLite write runs on in its thread after the run is cancelled; it
+    committed, so its numbers must stay — or every later save collides."""
+    import asyncio
+    import time
+
+    agent, _ = make_agent(tmp_path / "m.db", [ScriptedTurn(text=t) for t in ("1", "2", "3")])
+    await agent.run("q1")
+    backend = agent.memory.long_term.backend
+    original = backend._run
+    entered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def slow(work, *, immediate=False):
+        if work.__qualname__.startswith("SQLiteBackend.save_session"):
+            loop.call_soon_threadsafe(entered.set)
+            time.sleep(0.2)
+        return original(work, immediate=immediate)
+
+    backend._run = slow
+    task = asyncio.create_task(agent.run("q2"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    backend._run = original
+    await agent.run("q3")
+
+    assert events(agent, EventType.ERROR, "session_save_failed") == []
+    seqs, texts = await _log_contents(agent)
+    assert seqs == list(range(1, 7))
+    assert texts == ["q1", "1", "q2", "2", "q3", "3"]
+    await agent.memory.close()
+
+
+async def test_concurrent_saves_do_not_reuse_numbers(tmp_path):
+    import asyncio
+
+    agent, _ = make_agent(tmp_path / "m.db", [ScriptedTurn(text="one")])
+    await agent.run("q1")
+    agent.memory.short_term.append(UserMessage(content="extra"))
+    await asyncio.gather(agent._flush_session(), agent._flush_session())
+
+    assert events(agent, EventType.ERROR, "session_save_failed") == []
+    seqs, _ = await _log_contents(agent)
+    assert seqs == [1, 2, 3]
+    await agent.memory.close()
+
+
+async def test_messages_cleared_after_a_failed_save_still_reach_the_log():
+    class FlakySaves(InMemoryBackend):
+        fail = True
+
+        async def save_session(self, *args, **kwargs):
+            if self.fail:
+                raise OSError("disk full")
+            await super().save_session(*args, **kwargs)
+
+    backend = FlakySaves()
+    agent = Agent(
+        "claude-haiku-4-5",
+        api_key="k",
+        provider=MockLLMProvider([ScriptedTurn(text="one"), ScriptedTurn(text="two")]),
+        memory=MemoryConfig(),
+        memory_backend=backend,
+        session_id="s",
+    )
+    await agent.run("q1")  # the save fails: nothing logged
+    backend.fail = False
+    await agent.clear_history()
+    await agent.run("q2")
+
+    log = await backend.session_log("default", "s")
+    assert [str(e.message["content"]) for e in log] == ["q1", "one", "q2", "two"]
+
+
+def test_ram_only_memory_holds_nothing_for_a_log():
+    """Without a log, messages a trim drops must not pile up anywhere."""
+    agent = Agent("claude-haiku-4-5", api_key="k", memory=MemoryConfig())
+    memory = agent.memory.short_term
+    assert memory.track_unlogged is False
+    memory.extend([UserMessage(content="q"), AssistantMessage(content="a")] * 3)
+    memory.drop_head(2)
+    memory.clear()
+    assert memory.unlogged_dropped() == []

@@ -100,8 +100,11 @@ class ShortTermMemory:
         self._messages: list[AnyMessage] = []
         self._state = ContextState()
         self._epoch = next(_EPOCHS)
-        # Messages a trim removed before they were logged; the next session
-        # flush logs them first, so the log misses nothing.
+        # With a session log (set by the agent): messages that leave the
+        # history before they were logged are held here until the next flush
+        # logs them, so the log misses nothing. Without one nothing is held —
+        # it would only grow.
+        self.track_unlogged = False
         self._unlogged_dropped: list[AnyMessage] = []
 
     # ---- the history ----
@@ -123,9 +126,9 @@ class ShortTermMemory:
         A state describes one particular history, so keeping the old one for a
         new history would clear or cut the wrong messages.
         """
+        self._hold_unlogged(self._messages)
         self._messages = list(messages)
         self._state = state.copy() if state is not None else ContextState()
-        self._unlogged_dropped = []
         self._touch()
 
     def drop_head(self, count: int) -> list[AnyMessage]:
@@ -138,7 +141,7 @@ class ShortTermMemory:
             return []
         dropped = self._messages[:count]
         self._messages = self._messages[count:]
-        self._unlogged_dropped.extend(m for m in dropped if LOG_SEQ_KEY not in m.metadata)
+        self._hold_unlogged(dropped)
         results = sum(len(m.content) for m in dropped if isinstance(m, ToolResultMessage))
         self._state.cleared_results = max(0, self._state.cleared_results - results)
         self._state.reasoning_cut = max(0, self._state.reasoning_cut - len(dropped))
@@ -154,6 +157,26 @@ class ShortTermMemory:
     def state(self, value: ContextState) -> None:
         self._state = value
         self._touch()
+
+    def remove_tail(self, messages: list[AnyMessage]) -> bool:
+        """Take *messages* back off the end of the history, if they are its end.
+
+        For a run that left nothing but its own input behind (it was stopped
+        before any reply): the conversation continues as if it never ran.
+        """
+        n = len(messages)
+        if n == 0 or len(self._messages) < n:
+            return False
+        if any(a is not b for a, b in zip(self._messages[-n:], messages)):
+            return False
+        self._messages = self._messages[:-n]
+        self._state.reasoning_cut = min(self._state.reasoning_cut, len(self._messages))
+        self._touch()
+        return True
+
+    def _hold_unlogged(self, messages: Iterable[AnyMessage]) -> None:
+        if self.track_unlogged:
+            self._unlogged_dropped.extend(m for m in messages if LOG_SEQ_KEY not in m.metadata)
 
     def unlogged_dropped(self) -> list[AnyMessage]:
         """Messages a trim removed before they were logged, oldest first."""
@@ -178,6 +201,7 @@ class ShortTermMemory:
         other = ShortTermMemory()
         other._messages = list(self._messages)
         other._state = self._state.copy()
+        other.track_unlogged = self.track_unlogged
         other._unlogged_dropped = list(self._unlogged_dropped)
         # Same content, so the same epoch: a token anchor stays valid for both
         # until either of them changes.

@@ -434,3 +434,49 @@ async def test_loop_applies_the_trim(streaming):
     # The provider saw the trimmed view, and the history itself was trimmed.
     assert mock.call_log[0]["message_count"] < stored_before + 1
     assert len(agent.get_history()) < stored_before + 2
+
+
+# ---------------- review regressions ----------------
+
+def test_an_unanswered_message_begins_its_own_turn():
+    """Injected context joins the message it was injected for; an earlier
+    user message that never got a reply does not — so it stays droppable."""
+    facts = UserMessage(content="<relevant_context>…</relevant_context>", metadata={"context": "relevant_facts"})
+    history = [
+        UserMessage(content="never answered"),
+        UserMessage(content="next question"),
+        AssistantMessage(content="answer"),
+        facts,
+        UserMessage(content="with facts"),
+    ]
+    assert _turn_starts(history) == [0, 1, 3]
+
+
+async def test_results_the_model_has_not_seen_are_never_cleared():
+    """Six parallel results arrive at once: all are new to the model, and
+    clearing any would only make it call the tool again."""
+    calls = [ToolCallRequest(id=f"p{i}", name="search", arguments={"q": str(i)}) for i in range(6)]
+    memory = _memory(
+        UserMessage(content="read all six"),
+        AssistantMessage(content="", tool_calls=calls),
+        ToolResultMessage(
+            content=[ToolResult(tool_use_id=f"p{i}", name="search", content="r" * 4_000) for i in range(6)]
+        ),
+    )
+    out = await _mgr(limit=4_000, cap=900).assemble(memory, call=2)
+
+    assert not any(_is_note(r) for r in _results(out.messages))
+
+
+async def test_a_trim_that_makes_the_prompt_fit_is_applied():
+    """Short of the usual headroom, but without it the prompt could not be sent."""
+    mgr = ContextManager(
+        system_prompt="", max_context_tokens=18_000, max_tool_result_tokens=1_000, usable_tokens=18_000
+    )
+    memory = _memory(*_turn(0, answer_chars=12_000), *_turn(1, 8), *_turn(2, 8))
+    memory.append(UserMessage(content="y" * 66_000))  # ≈16.5k: fits on its own
+    out = await mgr.assemble(memory)  # ≈19.7k → dropping turn 0 gives ≈16.7k
+
+    assert out.trim.applied
+    assert out.trim.estimated_after > 18_000 * 0.9  # above the usual headroom ...
+    assert out.estimated_tokens <= 18_000  # ... yet within what can be sent

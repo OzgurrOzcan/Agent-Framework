@@ -168,3 +168,29 @@ def test_max_result_tokens_must_be_positive(bad):
         tool(description="x", max_result_tokens=bad)(lambda: "x")
     with pytest.raises(ValueError, match="default_max_result_tokens"):
         ToolExecutor(default_max_result_tokens=bad)
+
+
+async def test_an_unknown_tool_result_is_capped_too():
+    """It lists every available tool — long with many MCP servers."""
+    from agent_framework.core.agent import Agent
+    from agent_framework.core.config import AgentConfig
+    from agent_framework.core.message import ToolResultMessage
+    from agent_framework.tests.mocks.mock_llm import MockLLMProvider, ScriptedTurn
+
+    many = [_returning("x", name=f"tool_with_a_long_name_{i}") for i in range(200)]
+    mock = MockLLMProvider(
+        [
+            ScriptedTurn(tool_calls=[{"id": "u1", "name": "no_such_tool", "arguments": {}}]),
+            ScriptedTurn(text="done"),
+        ]
+    )
+    agent = Agent(
+        AgentConfig(model="claude-haiku-4-5", api_key="k", max_tool_result_tokens=100),
+        tools=many,
+        provider=mock,
+    )
+    await agent.run("go")
+
+    [result] = next(m for m in agent.get_history() if isinstance(m, ToolResultMessage)).content
+    assert result.is_error and result.content.startswith("Unknown tool `no_such_tool`")
+    assert "truncated" in result.content and len(result.content) < 1_000

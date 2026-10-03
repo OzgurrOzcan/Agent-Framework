@@ -326,10 +326,18 @@ class SQLiteBackend(LongTermBackend, SessionStore):
         text: str,
         *,
         session_id: str | None = None,
+        expected_upto: int | None = None,
         summarized_upto: int = 0,
-    ) -> None:
-        def work(conn: sqlite3.Connection) -> None:
+    ) -> bool:
+        def work(conn: sqlite3.Connection) -> bool:
             now = _now()
+            if session_id is not None and expected_upto is not None:
+                row = conn.execute(
+                    "SELECT summarized_upto FROM session_state WHERE namespace=? AND session_id=?",
+                    (namespace, session_id),
+                ).fetchone()
+                if row is not None and row["summarized_upto"] != expected_upto:
+                    return False  # summarized by another session meanwhile
             last = conn.execute(
                 "SELECT MAX(seq) AS seq FROM summary_segments WHERE namespace=?", (namespace,)
             ).fetchone()["seq"]
@@ -355,8 +363,9 @@ class SQLiteBackend(LongTermBackend, SessionStore):
                     "WHERE namespace=? AND session_id=?",
                     (summarized_upto, namespace, session_id),
                 )
+            return True
 
-        await self._call(work, immediate=True)
+        return await self._call(work, immediate=True)
 
     async def merge_summaries(
         self, namespace: str, first_seq: int, second_seq: int, text: str

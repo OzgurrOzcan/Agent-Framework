@@ -165,17 +165,25 @@ class InMemoryBackend(LongTermBackend, SessionStore):
         text: str,
         *,
         session_id: str | None = None,
+        expected_upto: int | None = None,
         summarized_upto: int = 0,
-    ) -> None:
+    ) -> bool:
         async with self._lock:
+            stored = self._sessions.get((namespace, session_id)) if session_id else None
+            if (
+                stored is not None
+                and expected_upto is not None
+                and stored.summarized_upto != expected_upto
+            ):
+                return False  # summarized by another session meanwhile
             segments = self._segments.setdefault(namespace, [])
             if not segments and self._summaries.get(namespace):
                 segments.append(SummarySegment(seq=1, text=self._summaries[namespace]))
             next_seq = (segments[-1].seq if segments else 0) + 1
             segments.append(SummarySegment(seq=next_seq, text=text))
-            stored = self._sessions.get((namespace, session_id)) if session_id else None
             if stored is not None:
                 stored.summarized_upto = max(stored.summarized_upto, summarized_upto)
+            return True
 
     async def merge_summaries(
         self, namespace: str, first_seq: int, second_seq: int, text: str

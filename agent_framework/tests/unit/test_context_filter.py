@@ -293,3 +293,49 @@ async def test_a_per_call_reminder_stays_where_it_was_sent_mid_run():
     assert contents(first) == ["task", "(be brief)"]
     assert second[: len(first)] == first
     assert events(agent, "context_filter_rejected")
+
+
+# ---------------- review regressions ----------------
+
+async def test_a_pure_filter_is_not_rejected_after_a_run_start_strip():
+    """At a run's start the reasoning before the current turn is stripped;
+    later calls of the same pure filter must compare with that applied."""
+
+    def last_two_turns(messages, info):
+        starts = [
+            i
+            for i, m in enumerate(messages)
+            if type(m) is UserMessage and (i == 0 or type(messages[i - 1]) is not UserMessage)
+        ]
+        return messages[starts[-2]:] if len(starts) >= 2 else messages
+
+    script = []
+    for run in range(3):
+        script += [
+            ScriptedTurn(
+                tool_calls=[{"id": f"c{run}", "name": "search", "arguments": {"q": str(run)}}],
+                reasoning=[{"type": "thinking", "signature": f"{run}a"}],
+            ),
+            ScriptedTurn(text=f"answer {run}", reasoning=[{"type": "thinking", "signature": f"{run}b"}]),
+        ]
+    agent, mock = make_agent(script, last_two_turns, model="claude-opus-5-5", memory=MemoryConfig())
+    for run in range(3):
+        await agent.run(f"question {run}")
+
+    assert not events(agent, "context_filter_rejected")
+    for earlier, later in zip(mock.call_log[::2], mock.call_log[1::2]):  # the two calls of a run
+        assert later["messages"][: len(earlier["messages"])] == earlier["messages"]
+
+
+async def test_filters_work_on_a_pause_turn_continuation():
+    from agent_framework.core.message import StopReason
+
+    agent, mock = make_agent(
+        [ScriptedTurn(text="searching", stop_reason=StopReason.PAUSE_TURN), ScriptedTurn(text="done")],
+        lambda messages, info: messages,
+    )
+    result = await agent.run("hi")
+
+    assert result.final_message == "done"
+    assert not events(agent, "context_filter_error")
+    assert mock.call_log[1]["messages"][-1].content == "searching"  # re-sent to continue

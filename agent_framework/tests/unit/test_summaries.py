@@ -13,7 +13,7 @@ import pytest
 
 from agent_framework.core.agent import Agent
 from agent_framework.core.config import AgentConfig, MemoryConfig
-from agent_framework.core.message import AssistantMessage, UserMessage
+from agent_framework.core.message import AssistantMessage, StopReason, UserMessage
 from agent_framework.memory.summaries import SUMMARY_BUDGET_TOKENS
 from agent_framework.tests.mocks.mock_llm import MockLLMProvider, ScriptedTurn
 from agent_framework.tracing.trace import EventType, SpanStatus
@@ -377,3 +377,139 @@ async def test_an_old_single_summary_becomes_the_first_segment(store):
         "new",
     ]
     await store.close()
+
+
+# ---------------- review regressions ----------------
+
+async def test_a_long_lived_agent_never_summarizes_turns_twice(tmp_path):
+    """Another session summarized this one's tail while it sat idle; the
+    agent object stayed alive and must not cover the same turns again."""
+    db = tmp_path / "m.db"
+    a, mock_a = make_agent(db, [ScriptedTurn(text="a1"), ScriptedTurn(text="a2")], session_id="A")
+    await a.run("my name is Ada")
+    _make_idle(db, "A")
+    b, _ = make_agent(db, [ScriptedTurn(text="IDLE-OF-A"), ScriptedTurn(text="hi")], session_id="B")
+    await b.run("hello")
+
+    mock_a.add_turn(ScriptedTurn(text="EXPLICIT"))
+    await a.run("I live in Oslo")
+    await a.memory.summarize()
+
+    [call] = summary_calls(mock_a)
+    assert "Ada" not in call["messages"][0].content and "Oslo" in call["messages"][0].content
+    assert await segments(a) == ["IDLE-OF-A", "EXPLICIT"]
+    for agent in (a, b):
+        await agent.memory.close()
+
+
+async def test_a_conflicting_append_is_discarded_not_duplicated(tmp_path):
+    store_path = tmp_path / "m.db"
+    agent, _ = make_agent(store_path, [ScriptedTurn(text="answer")])
+    await agent.run("q")
+    store = agent.memory.long_term.backend
+    # Another process advanced the marker after this agent last read it.
+    await store.append_summary("default", "OTHER", session_id="s1", summarized_upto=2)
+    ok = await store.append_summary(
+        "default", "MINE", session_id="s1", expected_upto=0, summarized_upto=2
+    )
+    assert ok is False
+    assert await segments(agent) == ["OTHER"]
+    await agent.memory.close()
+
+
+class _UnreadableSessions:
+    """Mix-in: the session row cannot be read."""
+
+    async def load_session(self, namespace, session_id):
+        raise OSError("unreadable")
+
+
+async def test_a_session_that_could_not_be_loaded_is_never_summarized():
+    from agent_framework.memory.backends.in_memory import InMemoryBackend
+    from agent_framework.memory.sessions import LogEntry, SessionRecord
+
+    class Unreadable(_UnreadableSessions, InMemoryBackend):
+        pass
+
+    backend = Unreadable()
+    await InMemoryBackend.save_session(
+        backend, "default", "s", SessionRecord(history=[], state={}, last_seq=1),
+        [LogEntry(1, UserMessage(content="already summarized").to_dict())],
+    )
+    mock = MockLLMProvider([ScriptedTurn(text="ok"), ScriptedTurn(text="SUMMARY")])
+    agent = Agent(
+        AgentConfig(model="claude-haiku-4-5", api_key="k"),
+        provider=mock,
+        memory=MemoryConfig(),
+        memory_backend=backend,
+        session_id="s",
+    )
+    await agent.run("q")
+    assert await agent.memory.summarize() is False
+    assert summary_calls(mock) == []
+    assert await backend.summary_segments("default") == []
+
+
+async def test_the_summary_budget_follows_the_window(tmp_path):
+    """On an 8k model a summary written for a large window must not fill the
+    prompt of every new conversation."""
+    mock = MockLLMProvider([ScriptedTurn(text="hi")])
+    agent = Agent(
+        AgentConfig(
+            model="openai:local-8k",
+            base_url="http://127.0.0.1:1/v1",
+            context_window=8_192,
+        ),
+        provider=mock,
+        memory=MemoryConfig(store=str(tmp_path / "m.db")),
+    )
+    budget = agent._summarizer.budget_tokens
+    assert budget == agent.config.resolved_max_context_tokens // 5
+    await agent.memory.long_term.backend.append_summary("default", "z" * 32_000)  # ≈8k tokens
+
+    result = await agent.run("hello")
+    assert result.stop_reason is not StopReason.CONTEXT_EXCEEDED
+    head = mock.call_log[0]["messages"][0]
+    assert head.metadata.get("context") == "summary"
+    assert len(head.content) <= budget * 4 + 200
+    await agent.memory.close()
+
+
+async def test_a_claim_is_released_when_the_tail_cannot_be_read(tmp_path):
+    db = tmp_path / "m.db"
+    old, _ = make_agent(db, [ScriptedTurn(text="noted")], session_id="old")
+    await old.run("remember the eu-1 cluster")
+    await old.memory.close()
+    _make_idle(db, "old")
+
+    failing, _ = make_agent(db, [ScriptedTurn(text="hi")], session_id="b")
+    backend = failing.memory.long_term.backend
+
+    async def broken_log(*args, **kwargs):
+        raise OSError("disk read error")
+
+    backend.session_log = broken_log
+    await failing.run("hello")
+    assert events(failing, "summary_failed")
+    await failing.memory.close()
+
+    later, mock = make_agent(db, [ScriptedTurn(text="IDLE"), ScriptedTurn(text="hi")], session_id="c")
+    await later.run("hello")
+    assert len(summary_calls(mock)) == 1  # released: still there to summarize
+    await later.memory.close()
+
+
+@pytest.mark.parametrize("broken", ["search_facts", "summary_segments"])
+async def test_an_unreadable_store_costs_memory_context_not_the_run(tmp_path, broken):
+    agent, _ = make_agent(tmp_path / "m.db", [ScriptedTurn(text="ok")])
+    backend = agent.memory.long_term.backend
+
+    async def fail(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    setattr(backend, broken, fail)
+    result = await agent.run("hello")
+
+    assert result.error is None and result.final_message == "ok"
+    assert [e for e in agent.get_trace().all_spans() if e.name.startswith("memory_read_failed")]
+    await agent.memory.close()

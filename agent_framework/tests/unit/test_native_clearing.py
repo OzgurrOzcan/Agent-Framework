@@ -165,3 +165,15 @@ async def test_the_preflight_guard_counts_what_the_provider_clears():
     assert loop._window_exceeded(over, turn_num=1) is None  # 4k of it never reaches the model
     memory.clear()  # what was cleared may be gone: no longer counted
     assert loop._window_exceeded(over, turn_num=1) is not None
+
+
+async def test_server_side_clearing_keeps_the_whole_unseen_batch():
+    """The results of the model's last call are new to it: the server must
+    keep all of them, however many parallel calls there were."""
+    calls = [{"id": f"p{i}", "name": "search", "arguments": {"q": str(i)}} for i in range(7)]
+    agent, mock = make_agent([ScriptedTurn(tool_calls=calls), ScriptedTurn(text="done")])
+    await agent.run("search seven things")
+
+    first, second = mock.call_log[0]["context_edits"], mock.call_log[1]["context_edits"]
+    assert first.keep_results == agent._context_manager.keep_recent_results()
+    assert second.keep_results == 7

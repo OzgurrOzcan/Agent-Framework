@@ -43,6 +43,7 @@ the head of the view.
 
 from __future__ import annotations
 
+import asyncio
 import bisect
 import copy
 import dataclasses
@@ -61,6 +62,7 @@ from agent_framework.core.message import (
     estimate_tokens,
 )
 from agent_framework.core.context_filter import (
+    CONTEXT_KEY,
     ContextFilter,
     ContextInfo,
     FilterOutcome,
@@ -72,7 +74,7 @@ from agent_framework.core.context_filter import (
 )
 from agent_framework.memory.short_term import ContextState, ShortTermMemory
 from agent_framework.tools.builtin.ask_user import ASK_USER_TOOL_NAME
-from agent_framework.tracing.trace import EventType, ExecutionTrace, SpanStatus
+from agent_framework.tracing.trace import ErrorInfo, EventType, ExecutionTrace, SpanStatus
 
 if TYPE_CHECKING:
     from agent_framework.memory.manager import MemoryManager
@@ -97,9 +99,6 @@ KEEP_RECENT_RESULTS = 5
 KEEP_RECENT_TURNS = 3
 # Results this small are never cleared: the note would save next to nothing.
 PROTECTED_RESULT_TOKENS = 64
-# Metadata marking a message the framework injected (not written by the user).
-CONTEXT_KEY = "context"
-
 # A trim that cannot reach the target is applied only if it leaves at least
 # this share of the limit free; a smaller gain would trigger the next trim —
 # and the next cache rebuild — almost immediately.
@@ -254,6 +253,7 @@ class ContextManager:
         binds_reasoning: bool = False,
         model: str = "",
         summarizer: Summarizer | None = None,
+        usable_tokens: int | None = None,
     ) -> None:
         if max_context_tokens < 1 or max_tool_result_tokens < 1:
             raise ValueError("max_context_tokens and max_tool_result_tokens must be >= 1")
@@ -261,6 +261,9 @@ class ContextManager:
         self._system_raw = estimate_tokens(system_prompt)
         self._limit = max_context_tokens
         self._result_cap = max_tool_result_tokens
+        # The most the prompt may use at all (window minus the response). A
+        # trim that brings an over-full prompt within it is always worth it.
+        self._usable = usable_tokens if usable_tokens is not None else max_context_tokens
         self._tools = tools
         self._memory = memory
         self._trace = trace
@@ -288,6 +291,9 @@ class ContextManager:
         self._last_sent: list[AnyMessage] | None = None
         self._last_view_len = 0
         self._last_epoch = 0
+        # This run's first call left out reasoning before the current turn: the
+        # filter's later candidates are compared with that applied too.
+        self._stripped_this_run = False
 
     # ------------------------------------------------------------ properties
     @property
@@ -478,14 +484,22 @@ class ContextManager:
         """
         if self._memory is None or self._memory.long_term is None:
             return
+        # Errors are feedback, never crashes: an unreadable store costs this
+        # run its memory context, not the run itself.
         if len(memory) == 0 and memory.state.pinned is None:
-            if self._summarizer is not None:
-                if not dry_run:
-                    await self._summarizer.on_conversation_start()
-                segments = await self._summarizer.segments()
-            else:
-                legacy = await self._memory.rolling_summary()
-                segments = [legacy] if legacy else []
+            try:
+                if self._summarizer is not None:
+                    if not dry_run:
+                        await self._summarizer.on_conversation_start()
+                    segments = await self._summarizer.segments()
+                else:
+                    legacy = await self._memory.rolling_summary()
+                    segments = [legacy] if legacy else []
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._memory_read_failed("summary", exc)
+                segments = []
             if segments:
                 state = memory.state.copy()
                 state.summary = segments
@@ -493,7 +507,13 @@ class ContextManager:
                 self._record_memory_read(
                     "summary", segments=len(segments), chars=sum(len(s) for s in segments)
                 )
-        facts = await self._memory.relevant_facts(user_input)
+        try:
+            facts = await self._memory.relevant_facts(user_input)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._memory_read_failed("relevant_facts", exc)
+            return
         seen = _injected_facts(memory.snapshot())
         new = [f for f in facts if (f.get("key"), f.get("value")) not in seen]
         if new:
@@ -507,6 +527,15 @@ class ContextManager:
                 )
             )
             self._record_memory_read("relevant_facts", facts=len(new))
+
+    def _memory_read_failed(self, name: str, exc: BaseException) -> None:
+        if self._trace is not None:
+            self._trace.record_event(
+                EventType.ERROR,
+                name=f"memory_read_failed:{name}",
+                status=SpanStatus.ERROR,
+                error=ErrorInfo.from_exception(exc),
+            )
 
     def _record_memory_read(self, name: str, **payload: Any) -> None:
         if self._trace is not None:
@@ -632,6 +661,12 @@ class ContextManager:
         of blocks keeps the rest valid); in the middle of a run the edit is
         rejected and the reference itself is sent.
         """
+        if run_start:
+            self._stripped_this_run = False
+        elif self._stripped_this_run:
+            # Same rule as at the run's start, so a pure filter's output still
+            # extends what was sent.
+            candidate, _ = without_reasoning_before(candidate, current_turn_start(candidate))
         reference = self._sent_so_far(memory, view)
         if reference is not None:
             sent, appended = reference
@@ -644,6 +679,8 @@ class ContextManager:
                 return sent + appended
         stripped, count = without_reasoning_before(candidate, current_turn_start(candidate))
         outcome.reasoning_stripped = count
+        if run_start:
+            self._stripped_this_run = True
         return stripped
 
     def _sent_so_far(
@@ -747,12 +784,14 @@ class ContextManager:
         current_turn = starts[-1] if starts else len(history)
         raw_before = _raw(self.render_view(history, state))
 
-        # 1. Clear all but the newest k clearable results.
+        # 1. Clear all but the newest k clearable results — and never one the
+        #    model has not seen yet (those after its last message), however
+        #    many parallel calls returned at once.
         clearable = self._clearable_ordinals(history)
         keep = self.keep_recent_results()
         cleared_zone = state.cleared_results
         if len(clearable) > keep:
-            cleared_zone = max(cleared_zone, clearable[-keep])
+            cleared_zone = max(cleared_zone, min(clearable[-keep], _first_unseen_result(history)))
         cleared_now = _count_below(clearable, cleared_zone) - _count_below(
             clearable, state.cleared_results
         )
@@ -794,7 +833,10 @@ class ContextManager:
                     break
 
         changed = cleared_now > 0 or drop > 0
-        useful = estimated <= int(limit * (1 - MIN_TRIM_HEADROOM))
+        useful = estimated <= int(limit * (1 - MIN_TRIM_HEADROOM)) or (
+            # Without it the prompt could not be sent at all.
+            estimated_before > self._usable and estimated <= self._usable
+        )
         applied = changed and useful
         if not applied:
             return state, 0, TrimOutcome(
@@ -851,17 +893,41 @@ def _is_user_turn(message: AnyMessage) -> bool:
 
 
 def _turn_starts(history: list[AnyMessage]) -> list[int]:
-    """Indices where a turn begins: a user message not preceded by one.
+    """Indices where a turn begins.
 
-    Consecutive user messages (injected context followed by the user's own
-    message) open a single turn, so cutting at a turn start never separates
-    them — and never separates a tool call from its result.
+    A turn begins at a user message, except one that directly follows
+    context the framework injected for it (facts before the user's own
+    message): cutting at a turn start therefore never separates the two, and
+    never a tool call from its result. A user message that follows another
+    user message the model never answered (a run stopped before replying)
+    begins its own turn, so that one can still be dropped later.
     """
     return [
         i
         for i, message in enumerate(history)
-        if _is_user_turn(message) and (i == 0 or not _is_user_turn(history[i - 1]))
+        if _is_user_turn(message)
+        and (
+            i == 0
+            or not _is_user_turn(history[i - 1])
+            or CONTEXT_KEY not in history[i - 1].metadata
+        )
     ]
+
+
+def _first_unseen_result(history: list[AnyMessage]) -> int:
+    """Ordinal of the first tool result after the last assistant message.
+
+    Those results answer calls the model made but have not been shown to it
+    yet; clearing one would only make it call the tool again.
+    """
+    last_assistant = max(
+        (i for i, m in enumerate(history) if isinstance(m, AssistantMessage)), default=-1
+    )
+    ordinal = 0
+    for message in history[: last_assistant + 1]:
+        if isinstance(message, ToolResultMessage):
+            ordinal += len(message.content)
+    return ordinal
 
 
 def _through_last_assistant(messages: list[AnyMessage]) -> int:

@@ -44,6 +44,7 @@ from agent_framework.core.message import (
     AnyMessage,
     AssistantMessage,
     Message,
+    StopReason,
     ToolCallRequest,
     ToolResult,
     ToolResultMessage,
@@ -51,6 +52,8 @@ from agent_framework.core.message import (
 )
 
 OMITTED_RESULT = "[result omitted from this context]"
+# Metadata marking a message the framework injected (not written by the user).
+CONTEXT_KEY = "context"
 
 
 @dataclass(frozen=True)
@@ -145,7 +148,8 @@ def repair(messages: list[AnyMessage]) -> tuple[list[AnyMessage], Repairs]:
 
     if not out:
         raise InvalidFilterOutput("the context filter left no user message to send")
-    if isinstance(out[-1], AssistantMessage):
+    # A paused server-side turn is continued by re-sending it as the last message.
+    if isinstance(out[-1], AssistantMessage) and out[-1].stop_reason is not StopReason.PAUSE_TURN:
         raise InvalidFilterOutput(
             "the context filter's view ends with an assistant message; it must "
             "end with the user's turn (or tool results)"
@@ -186,10 +190,15 @@ def without_reasoning_before(messages: list[AnyMessage], cut: int) -> tuple[list
 
 
 def current_turn_start(messages: list[AnyMessage]) -> int:
-    """Index of the first message of the last turn in *messages*."""
+    """Index of the first message of the last turn in *messages* (a user
+    message, together with context injected right before it)."""
     start = 0
     for i, message in enumerate(messages):
-        if _is_user_turn(message) and (i == 0 or not _is_user_turn(messages[i - 1])):
+        if _is_user_turn(message) and (
+            i == 0
+            or not _is_user_turn(messages[i - 1])
+            or CONTEXT_KEY not in messages[i - 1].metadata
+        ):
             start = i
     return start
 

@@ -70,7 +70,11 @@ from agent_framework.providers.base import (
     ToolResultClearing,
 )
 from agent_framework.tools.builtin.ask_user import ASK_USER_TOOL_NAME
-from agent_framework.tools.executor import ToolCancellationError, ToolExecutor
+from agent_framework.tools.executor import (
+    ToolCancellationError,
+    ToolExecutor,
+    cap_result_content,
+)
 from agent_framework.tools.models import ToolMetadata
 from agent_framework.tools.registry import ToolRegistry
 from agent_framework.tracing.cost import CostTracker
@@ -188,6 +192,8 @@ class AgentLoop:
         # Server-side tool-result clearing; switched off for the rest of the
         # session if the provider rejects it once.
         self.native_clearing = native_clearing
+        # The messages the current run appended at its start (see _end_run).
+        self._run_input: list[AnyMessage] = []
         # Concurrent runs would interleave into the same short-term memory.
         self._running = False
 
@@ -215,8 +221,29 @@ class AgentLoop:
             memory.clear()
         else:
             _answer_unanswered_calls(memory)
+        start = len(memory)
         await self.context.start_run(memory, user_input, dry_run=dry_run)
         memory.append(UserMessage(content=user_input))
+        if not dry_run:
+            # What this run added; taken back if it never gets a reply.
+            self._run_input = memory.snapshot()[start:]
+
+    def _end_run(self, *, failed: bool) -> bool:
+        """Undo a remembered run that failed before any reply. True if undone.
+
+        A run that failed before the model answered — the prompt would not
+        fit, the provider rejected it — left nothing but its input; kept, an
+        oversized input would make every later run fail the same way. The
+        conversation continues as if the run had not happened. A run the
+        caller stopped (cancelled, stream closed) keeps its input: that
+        message was sent, and is part of the conversation the user saw.
+        """
+        run_input, self._run_input = self._run_input, []
+        if not failed or not self.retain_history or not run_input:
+            return False
+        if self.short_term.last is not run_input[-1]:
+            return False
+        return self.short_term.remove_tail(run_input)
 
     async def _assemble(self, turn: int) -> AssembledContext:
         """The view for this run's *turn*-th call. The context manager decides
@@ -296,9 +323,13 @@ class AgentLoop:
         protected = {ASK_USER_TOOL_NAME} | {
             t.metadata.name for t in self.tools if not t.metadata.clear_old_results
         }
+        # Never clear a result the model has not seen yet: keep at least the
+        # whole batch that answers its last message.
+        last = self.short_term.last
+        unseen = len(last.content) if isinstance(last, ToolResultMessage) else 0
         return ToolResultClearing(
             trigger_tokens=limit,
-            keep_results=self.context.keep_recent_results(),
+            keep_results=max(self.context.keep_recent_results(), unseen),
             # Each clear rebuilds the prompt cache: only worth it in bulk.
             clear_at_least_tokens=max(1, limit // 10),
             exclude_tools=tuple(sorted(protected)),
@@ -370,7 +401,13 @@ class AgentLoop:
                     policy, streaming=False, retain_history=self.retain_history
                 ),
             ) as run_span:
-                result = await self._run_inner(user_input, policy=policy)
+                result: AgentResult | None = None
+                try:
+                    result = await self._run_inner(user_input, policy=policy)
+                finally:
+                    failed = result is not None and result.error is not None
+                    if self._end_run(failed=failed):
+                        run_span.update(input_rolled_back=True)
                 run_span.update(
                     stop_reason=result.stop_reason.value,
                     turns=result.state.turn,
@@ -683,6 +720,7 @@ class AgentLoop:
         # report this run's own numbers; the trace-wide turn counter is
         # cumulative across runs.
         state = LoopState()
+        errored = False
         try:
             with self.trace.start_span(
                 EventType.RUN,
@@ -700,6 +738,7 @@ class AgentLoop:
                     ) as chunks:
                         async for chunk in chunks:
                             if chunk.type is StreamChunkType.ERROR:
+                                errored = True
                                 # Streaming reports failure as an ERROR chunk,
                                 # not an AgentResult, so mark the span here.
                                 # Provider chunks are forwarded verbatim, so
@@ -720,6 +759,8 @@ class AgentLoop:
                                 )
                             yield chunk
                 finally:
+                    if self._end_run(failed=errored):
+                        run_span.update(input_rolled_back=True)
                     run_span.update(
                         turns=state.turn,
                         tool_rounds=state.tool_rounds,
@@ -1007,13 +1048,15 @@ class AgentLoop:
 
         for tc, t, decision in verdicts:
             if t is None:
+                # Capped like every result: with many MCP tools the list is long.
+                content, _, _ = cap_result_content(
+                    f"Unknown tool `{tc.name}`. Available: {', '.join(self.tools.names)}",
+                    self.executor.result_cap(self._meta_or_synth(tc)),
+                )
                 results_map[tc.id] = ToolResult(
                     tool_use_id=tc.id,
                     name=tc.name,
-                    content=(
-                        f"Unknown tool `{tc.name}`. "
-                        f"Available: {', '.join(self.tools.names)}"
-                    ),
+                    content=content,
                     is_error=True,
                 )
             elif decision.verdict == Verdict.ALLOW:

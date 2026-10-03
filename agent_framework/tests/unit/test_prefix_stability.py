@@ -301,3 +301,37 @@ async def test_the_summary_is_a_stable_snapshot_at_the_head():
     first, second = mock.call_log[0]["messages"], mock.call_log[1]["messages"]
     assert "short answers" in first[0].content
     assert second[: len(first)] == first  # unchanged: a snapshot, not re-read per call
+
+
+async def test_an_oversized_message_does_not_brick_a_conversation():
+    """A message too large to send is not kept unanswered in the history,
+    where every later message would join it in an untrimmable turn."""
+    agent, _ = make_agent(
+        "claude-haiku-4-5",
+        [ScriptedTurn(text="ok")] * 6,
+        memory=MemoryConfig(),
+        context_window=20_000,
+        max_tokens_per_response=2_000,
+        max_context_tokens=None,
+    )
+    for i in range(3):
+        await agent.run(f"hello {i}")
+    huge = await agent.run("x" * 100_000)
+    assert huge.stop_reason is StopReason.CONTEXT_EXCEEDED
+    assert all("xxxx" not in str(m.content) for m in agent.get_history())
+    run = [e for e in agent.get_trace().all_spans() if e.event_type is EventType.RUN][-1]
+    assert run.payload["input_rolled_back"] is True
+
+    for i in range(3):
+        follow_up = await agent.run(f"small follow-up {i}")
+        assert follow_up.stop_reason is StopReason.END_TURN
+
+
+async def test_a_cancelled_run_keeps_its_message():
+    """Stopping a reply is not a failure: the message was sent and stays."""
+    agent, _ = make_agent("claude-haiku-4-5", [ScriptedTurn(text="ok")], memory=MemoryConfig())
+    stream = agent.run_stream("keep me")
+    async for _ in stream:
+        break
+    await stream.aclose()
+    assert [m.content for m in agent.get_history()] == ["keep me"]
