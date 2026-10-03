@@ -85,7 +85,7 @@ def test_legacy_dict_without_type_falls_back_with_warning():
     assert isinstance(r2, ToolResultMessage)
 
 
-def test_checkpoint_restore_full_fidelity():
+async def test_checkpoint_restore_full_fidelity():
     from agent_framework.core.agent import Agent
     from agent_framework.core.config import AgentConfig
 
@@ -101,7 +101,8 @@ def test_checkpoint_restore_full_fidelity():
 
     cid = agent.checkpoint()
     original = [m.to_dict() for m in agent.get_history()]
-    agent.clear_history()
+    await agent.clear_history()
+    assert agent.get_history() == []
     agent.memory.short_term.append(UserMessage(content="unrelated"))
 
     agent.restore(cid)

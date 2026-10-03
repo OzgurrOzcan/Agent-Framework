@@ -56,6 +56,11 @@ from agent_framework.memory.backends.base import LongTermBackend
 from agent_framework.memory.backends.sqlite import SQLiteBackend
 from agent_framework.memory.long_term import LongTermMemory
 from agent_framework.memory.manager import MemoryManager
+from agent_framework.memory.sessions import (
+    ConversationSession,
+    SessionStore,
+    tool_set_fingerprint,
+)
 from agent_framework.memory.short_term import ContextState
 from agent_framework.permissions.config import PermissionConfig
 from agent_framework.permissions.resolver import PermissionResolver
@@ -65,7 +70,12 @@ from agent_framework.tools.executor import ToolExecutor
 from agent_framework.tools.models import Tool
 from agent_framework.tools.registry import ToolRegistry, to_registry
 from agent_framework.tracing.cost import CostTracker, PricingTable
-from agent_framework.tracing.trace import EventType, ExecutionTrace
+from agent_framework.tracing.trace import (
+    ErrorInfo,
+    EventType,
+    ExecutionTrace,
+    SpanStatus,
+)
 
 CheckpointId = str
 
@@ -269,6 +279,11 @@ class Agent:
             model=self.config.model,
         )
         self._checkpoints: dict[CheckpointId, dict[str, Any]] = {}
+        # Saved conversation, when the long-term store keeps sessions. Loaded
+        # once before the first run, saved after every run.
+        self._session = _build_session(self.config.memory, self._memory, self.session_id)
+        self._session_ready = self._session is None
+        self._session_lock = asyncio.Lock()
         self._native_clearing = _native_clearing_available(self.config, self._provider)
 
         self._record_session_span()
@@ -306,12 +321,17 @@ class Agent:
         than serving a silently reduced toolset. (The plain constructor defers
         discovery to the first run, where a failing server is recorded in the
         trace and skipped instead — errors inside a run are never raised.)
-        Takes the same arguments as `Agent(...)`.
+        Takes the same arguments as `Agent(...)`. With `MemoryConfig(store=...)`
+        the saved conversation of `session_id` is loaded here as well.
         """
         tools = ToolRegistry(to_registry(kwargs.pop("tools", None)))
         for discovered in await mcp.discover_all(strict=True):
             tools.add(discovered)
-        return cls(config, tools=tools, mcp=mcp, _mcp_discovered=True, **kwargs)
+        agent = cls(config, tools=tools, mcp=mcp, _mcp_discovered=True, **kwargs)
+        # A saved conversation is loaded now too, so get_history() shows it
+        # before the first run.
+        await agent._ensure_session()
+        return agent
 
     async def _ensure_mcp(self) -> None:
         """Discover MCP tools once, before the first provider call."""
@@ -373,9 +393,13 @@ class Agent:
             max_tool_rounds=max_tool_rounds,
             tool_choice=tool_choice,
         )
+        await self._ensure_session()
         if dry_run:
             return await self._loop.dry_run(user_input, policy=policy)
-        return await self._loop.run(user_input, policy=policy)
+        try:
+            return await self._loop.run(user_input, policy=policy)
+        finally:
+            await self._flush_session()
 
     async def run_stream(
         self,
@@ -392,21 +416,26 @@ class Agent:
         its spans end as cancelled and the agent is immediately reusable.
         """
         await self._ensure_mcp()
-        # aclosing: without it, closing this generator leaves the loop's own
-        # generator suspended, so its "run in progress" flag is never cleared
-        # and every later run() on this agent raises.
-        async with contextlib.aclosing(
-            self._loop.stream(
-                user_input,
-                policy=self._run_policy(
-                    max_turns=max_turns,
-                    max_tool_rounds=max_tool_rounds,
-                    tool_choice=tool_choice,
-                ),
-            )
-        ) as chunks:
-            async for c in chunks:
-                yield c
+        await self._ensure_session()
+        try:
+            # aclosing: without it, closing this generator leaves the loop's
+            # own generator suspended, so its "run in progress" flag is never
+            # cleared and every later run() on this agent raises.
+            async with contextlib.aclosing(
+                self._loop.stream(
+                    user_input,
+                    policy=self._run_policy(
+                        max_turns=max_turns,
+                        max_tool_rounds=max_tool_rounds,
+                        tool_choice=tool_choice,
+                    ),
+                )
+            ) as chunks:
+                async for c in chunks:
+                    yield c
+        finally:
+            # Also when the consumer closes the stream early.
+            await self._flush_session()
 
     async def complete(
         self,
@@ -421,15 +450,19 @@ class Agent:
         tools should actually execute.
         """
         await self._ensure_mcp()
-        return await self._loop.run(
-            user_input,
-            policy=LoopPolicy(
-                max_turns=1,
-                execute_tools=False,
-                max_tool_rounds=0,
-                tool_choice=tool_choice,
-            ),
-        )
+        await self._ensure_session()
+        try:
+            return await self._loop.run(
+                user_input,
+                policy=LoopPolicy(
+                    max_turns=1,
+                    execute_tools=False,
+                    max_tool_rounds=0,
+                    tool_choice=tool_choice,
+                ),
+            )
+        finally:
+            await self._flush_session()
 
     # ===================== structured output (optional) =====================
     async def to_json(self, prompt: str, *, schema: Any) -> Any:
@@ -443,9 +476,17 @@ class Agent:
         """The stored conversation. Without memory: the last run's messages."""
         return self._memory.short_term.snapshot()
 
-    def clear_history(self) -> None:
-        """Forget the conversation (messages and context state)."""
+    async def clear_history(self) -> None:
+        """Forget the conversation (messages and context state).
+
+        With a store, the emptied conversation is saved too, so resuming the
+        same session_id later starts from nothing rather than the old history.
+        """
+        async with self._session_lock:
+            # Never load the old conversation after this.
+            self._session_ready = True
         self._memory.short_term.clear()
+        await self._flush_session()
 
     def get_trace(self) -> ExecutionTrace:
         return self._trace
@@ -490,6 +531,76 @@ class Agent:
             state=ContextState.from_dict(ckpt.get("context_state")),
         )
         self._cost.total_cost_usd = ckpt.get("cost", self._cost.total_cost_usd)
+
+    # ===================== sessions =====================
+    def _fingerprint(self) -> str:
+        return tool_set_fingerprint(self._system_prompt, self._tools)
+
+    async def _ensure_session(self) -> None:
+        """Load the saved conversation of `session_id` once, before the first run.
+
+        A store that cannot be read is recorded and the run continues from an
+        empty history — but nothing is saved for this agent afterwards, so
+        the conversation in the store is never overwritten by a fresh one.
+        """
+        if self._session_ready:
+            return
+        async with self._session_lock:
+            if self._session_ready or self._session is None:
+                return
+            session = self._session
+            try:
+                resumed, reasoning_dropped = await session.load(
+                    self._memory.short_term, self._fingerprint()
+                )
+            except Exception as exc:
+                self._session = None
+                self._trace.record_event(
+                    EventType.ERROR,
+                    name="session_load_failed",
+                    status=SpanStatus.ERROR,
+                    payload={"session_id": self.session_id},
+                    error=ErrorInfo.from_exception(exc),
+                )
+            else:
+                self._trace.record_event(
+                    EventType.MEMORY_READ,
+                    name="session",
+                    payload={
+                        "session_id": self.session_id,
+                        "resumed": resumed,
+                        "messages": len(self._memory.short_term),
+                        # The prompt or tool set changed since it was saved:
+                        # reasoning bound to the old ones is left out.
+                        "reasoning_dropped": reasoning_dropped,
+                    },
+                )
+            self._session_ready = True
+
+    async def _flush_session(self) -> None:
+        """Save the conversation after a run. Failures are traced, not raised."""
+        if self._session is None or not self._session_ready:
+            return
+        try:
+            logged = await self._session.flush(self._memory.short_term, self._fingerprint())
+        except Exception as exc:
+            self._trace.record_event(
+                EventType.ERROR,
+                name="session_save_failed",
+                status=SpanStatus.ERROR,
+                payload={"session_id": self.session_id},
+                error=ErrorInfo.from_exception(exc),
+            )
+            return
+        self._trace.record_event(
+            EventType.MEMORY_WRITE,
+            name="session",
+            payload={
+                "session_id": self.session_id,
+                "logged": logged,
+                "messages": len(self._memory.short_term),
+            },
+        )
 
     # ===================== internals =====================
     def _record_session_span(self) -> None:
@@ -698,6 +809,24 @@ def _build_memory(
         else None
     )
     return MemoryManager(long_term=long_term, owns_backend=owns, trace=trace)
+
+
+def _build_session(
+    memory: MemoryConfig | None, manager: MemoryManager, session_id: str
+) -> ConversationSession | None:
+    """The saved conversation, if the long-term store keeps sessions."""
+    if memory is None or manager.long_term is None:
+        return None
+    backend = manager.long_term.backend
+    if not isinstance(backend, SessionStore):
+        warnings.warn(
+            f"{type(backend).__name__} does not implement SessionStore, so "
+            "conversations are not saved or resumed — only its facts are used. "
+            "Implement SessionStore to keep sessions.",
+            stacklevel=3,
+        )
+        return None
+    return ConversationSession(backend, namespace=manager.long_term.namespace, session_id=session_id)
 
 
 def _build_provider(config: AgentConfig) -> BaseProviderAdapter:

@@ -27,6 +27,10 @@ from agent_framework.core.message import (
 # not even a history and its `copy()`.
 _EPOCHS = itertools.count(1)
 
+# Metadata key holding a message's sequence number in its session's log
+# (see memory.sessions). A message without it has not been logged yet.
+LOG_SEQ_KEY = "log_seq"
+
 
 @dataclass
 class ContextState:
@@ -86,6 +90,9 @@ class ShortTermMemory:
         self._messages: list[AnyMessage] = []
         self._state = ContextState()
         self._epoch = next(_EPOCHS)
+        # Messages a trim removed before they were logged; the next session
+        # flush logs them first, so the log misses nothing.
+        self._unlogged_dropped: list[AnyMessage] = []
 
     # ---- the history ----
     def append(self, message: AnyMessage) -> None:
@@ -108,6 +115,7 @@ class ShortTermMemory:
         """
         self._messages = list(messages)
         self._state = state.copy() if state is not None else ContextState()
+        self._unlogged_dropped = []
         self._touch()
 
     def drop_head(self, count: int) -> list[AnyMessage]:
@@ -120,6 +128,7 @@ class ShortTermMemory:
             return []
         dropped = self._messages[:count]
         self._messages = self._messages[count:]
+        self._unlogged_dropped.extend(m for m in dropped if LOG_SEQ_KEY not in m.metadata)
         results = sum(len(m.content) for m in dropped if isinstance(m, ToolResultMessage))
         self._state.cleared_results = max(0, self._state.cleared_results - results)
         self._state.reasoning_cut = max(0, self._state.reasoning_cut - len(dropped))
@@ -136,6 +145,11 @@ class ShortTermMemory:
         self._state = value
         self._touch()
 
+    def take_unlogged_dropped(self) -> list[AnyMessage]:
+        """Hand over (and forget) the dropped messages not yet logged."""
+        taken, self._unlogged_dropped = self._unlogged_dropped, []
+        return taken
+
     @property
     def epoch(self) -> int:
         """Changes whenever messages are removed or the state is replaced."""
@@ -149,6 +163,7 @@ class ShortTermMemory:
         other = ShortTermMemory()
         other._messages = list(self._messages)
         other._state = self._state.copy()
+        other._unlogged_dropped = list(self._unlogged_dropped)
         # Same content, so the same epoch: a token anchor stays valid for both
         # until either of them changes.
         other._epoch = self._epoch

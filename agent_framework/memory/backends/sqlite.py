@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from agent_framework.memory.backends.base import Fact, LongTermBackend
+from agent_framework.memory.sessions import LogEntry, SessionRecord, SessionStore, encode
 
 _T = TypeVar("_T")
 
@@ -40,10 +41,36 @@ CREATE TABLE IF NOT EXISTS summaries (
     summary TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Every message a session ever had, in order (see memory.sessions).
+CREATE TABLE IF NOT EXISTS session_messages (
+    namespace TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (namespace, session_id, seq)
+);
+
+-- What a resumed session continues from.
+CREATE TABLE IF NOT EXISTS session_state (
+    namespace TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    history TEXT NOT NULL,
+    state TEXT NOT NULL,
+    last_seq INTEGER NOT NULL DEFAULT 0,
+    fingerprint TEXT NOT NULL DEFAULT '',
+    summarized_upto INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (namespace, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_session_state_updated
+    ON session_state(namespace, updated_at DESC);
 """
 
 
-class SQLiteBackend(LongTermBackend):
+class SQLiteBackend(LongTermBackend, SessionStore):
     def __init__(self, path: str | Path = "agent_memory.db") -> None:
         self._path = str(path)
         self._lock = threading.Lock()
@@ -180,6 +207,87 @@ class SQLiteBackend(LongTermBackend):
             return row["summary"] if row else ""
 
         return await self._call(work)
+
+
+    # ----- sessions -----
+    async def load_session(self, namespace: str, session_id: str) -> SessionRecord | None:
+        def work(conn: sqlite3.Connection) -> SessionRecord | None:
+            row = conn.execute(
+                "SELECT * FROM session_state WHERE namespace=? AND session_id=?",
+                (namespace, session_id),
+            ).fetchone()
+            return _row_to_session(row) if row else None
+
+        return await self._call(work)
+
+    async def save_session(
+        self,
+        namespace: str,
+        session_id: str,
+        record: SessionRecord,
+        new_log: list[LogEntry],
+    ) -> None:
+        def work(conn: sqlite3.Connection) -> None:
+            now = _now()
+            conn.executemany(
+                "INSERT INTO session_messages(namespace, session_id, seq, message, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(namespace, session_id, e.seq, encode(e.message), now) for e in new_log],
+            )
+            # MAX(): a counter another writer advanced (another process
+            # summarizing this session) never moves backwards.
+            conn.execute(
+                """
+                INSERT INTO session_state(namespace, session_id, history, state, last_seq,
+                                          fingerprint, summarized_upto, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(namespace, session_id) DO UPDATE SET
+                    history=excluded.history,
+                    state=excluded.state,
+                    last_seq=MAX(session_state.last_seq, excluded.last_seq),
+                    fingerprint=excluded.fingerprint,
+                    summarized_upto=MAX(session_state.summarized_upto, excluded.summarized_upto),
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    namespace,
+                    session_id,
+                    encode(record.history),
+                    encode(record.state),
+                    record.last_seq,
+                    record.fingerprint,
+                    record.summarized_upto,
+                    record.created_at or now,
+                    now,
+                ),
+            )
+
+        await self._call(work)
+
+    async def session_log(
+        self, namespace: str, session_id: str, *, after_seq: int = 0
+    ) -> list[LogEntry]:
+        def work(conn: sqlite3.Connection) -> list[LogEntry]:
+            rows = conn.execute(
+                "SELECT seq, message FROM session_messages "
+                "WHERE namespace=? AND session_id=? AND seq>? ORDER BY seq",
+                (namespace, session_id, after_seq),
+            ).fetchall()
+            return [LogEntry(seq=r["seq"], message=json.loads(r["message"])) for r in rows]
+
+        return await self._call(work)
+
+
+def _row_to_session(row: sqlite3.Row) -> SessionRecord:
+    return SessionRecord(
+        history=json.loads(row["history"]),
+        state=json.loads(row["state"]),
+        last_seq=row["last_seq"],
+        fingerprint=row["fingerprint"],
+        summarized_upto=row["summarized_upto"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
 
 
 def _now() -> str:

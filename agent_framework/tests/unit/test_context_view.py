@@ -390,7 +390,7 @@ def _priced_agent(**config) -> tuple[Agent, MockLLMProvider]:
     return agent, mock
 
 
-def test_checkpoint_restores_the_context_state():
+async def test_checkpoint_restores_the_context_state():
     agent, _ = _priced_agent()
     short_term = agent.memory.short_term
     short_term.extend(_turn(0) + _turn(1))
@@ -398,7 +398,7 @@ def test_checkpoint_restores_the_context_state():
     short_term.state = state
 
     cid = agent.checkpoint()
-    agent.clear_history()
+    await agent.clear_history()
     assert short_term.state == ContextState()
 
     agent.restore(cid)
