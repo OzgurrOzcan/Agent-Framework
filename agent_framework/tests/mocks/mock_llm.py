@@ -12,9 +12,11 @@ Usage:
         ScriptedTurn(text="Here is what I found."),
     ])
 
-    # Plug into an agent by replacing its provider:
-    agent._provider = mock
-    agent._loop.provider = mock
+    # Plug it into an agent at construction (every component gets it):
+    agent = Agent("claude-opus-5", api_key="k", provider=mock)
+
+The mock is also the summarizer of a long-term store, so a script runs in
+call order: a trim's summary call comes before the call it trims for.
 """
 
 from __future__ import annotations

@@ -427,3 +427,21 @@ def test_from_env_still_validates(monkeypatch):
     monkeypatch.setenv("AGENT_MAX_TURNS", "0")
     with pytest.raises(ValueError, match="max_turns"):
         AgentConfig.from_env()
+
+
+def test_a_tool_cap_larger_than_the_room_after_a_trim_warns():
+    """Each such result would trigger the next trim: trims on every call."""
+    with pytest.warns(UserWarning, match="prompt-cache rebuild"):
+        cfg(max_context_tokens=10_000, max_tool_result_tokens=5_000)
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        cfg(max_context_tokens=10_000, max_tool_result_tokens=4_000)  # = the room left
+        cfg(max_context_tokens=10_000)  # the automatic cap always fits
+
+
+def test_the_trim_target_is_one_value():
+    from agent_framework.core import config, context_manager
+
+    assert config._TRIM_TARGET_SHARE == context_manager.TRIM_TARGET_SHARE

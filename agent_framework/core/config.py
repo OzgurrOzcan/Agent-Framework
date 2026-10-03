@@ -62,6 +62,9 @@ _AUTO_CONTEXT_CEILING = 150_000
 # A single tool result may use at most 10 % of the window, 16k tokens, or a
 # fifth of the trim limit — so a few recent results always fit after a trim.
 _AUTO_TOOL_RESULT_CEILING = 16_000
+# A trim brings the prompt down to this share of max_context_tokens (kept in
+# sync with core.context_manager.TRIM_TARGET_SHARE, which a test asserts).
+_TRIM_TARGET_SHARE = 0.60
 
 # Fields that existed before and what replaces them, so a stale config file
 # fails with a migration hint instead of a bare "unknown field".
@@ -322,6 +325,19 @@ class AgentConfig:
             f"exceed max_context_tokens ({context_limit}); one result that size "
             "would fill the whole prompt.",
         )
+        # A trim leaves 40 % of the limit to grow into. A single result larger
+        # than that triggers the next trim on its own, so trims (and prompt
+        # cache rebuilds) would follow every such result instead of being rare.
+        headroom = context_limit - int(context_limit * _TRIM_TARGET_SHARE)
+        if self.max_tool_result_tokens is not None and self.max_tool_result_tokens > headroom:
+            warnings.warn(
+                f"max_tool_result_tokens ({self.max_tool_result_tokens}) exceeds the "
+                f"{headroom} tokens a trim leaves free under max_context_tokens "
+                f"({context_limit}): each result that large can trigger another trim, "
+                "and with it a prompt-cache rebuild. Lower it, or raise "
+                "max_context_tokens.",
+                stacklevel=3,
+            )
 
     # ---------------- derived ----------------
     @property
