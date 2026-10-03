@@ -124,6 +124,22 @@ def test_redaction_keeps_numeric_token_counters():
     assert ev.payload["auth_token"] == "[REDACTED]"
 
 
+def test_redaction_keeps_none_values():
+    # `None` is how a setting says "automatic" (max_context_tokens=None);
+    # redacting it would hide whether the value was set, and it holds no secret.
+    trace = ExecutionTrace()
+    ev = trace.record_event(
+        EventType.SESSION,
+        payload={
+            "max_context_tokens": None,
+            "nested": {"api_key": None, "password": "hunter2"},
+        },
+    )
+    assert ev.payload["max_context_tokens"] is None
+    assert ev.payload["nested"]["api_key"] is None
+    assert ev.payload["nested"]["password"] == "[REDACTED]"
+
+
 def test_span_payload_and_update_redacted():
     trace = ExecutionTrace()
     with trace.start_span(
