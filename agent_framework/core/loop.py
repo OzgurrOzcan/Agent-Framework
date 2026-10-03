@@ -185,9 +185,6 @@ class AgentLoop:
         self.agent_id = agent_id
         # False = stateless: each run starts from an empty history.
         self.retain_history = retain_history
-        # Editing already-sent messages mid-run would invalidate this model's
-        # reasoning, so it is only trimmed at a run's first call.
-        self._binds_reasoning = config.reasoning_binds_to_prefix
         # Server-side tool-result clearing; switched off for the rest of the
         # session if the provider rejects it once.
         self.native_clearing = native_clearing
@@ -215,11 +212,10 @@ class AgentLoop:
         memory.append(UserMessage(content=user_input))
 
     async def _assemble(self, turn: int) -> AssembledContext:
-        """The view for this run's *turn*-th call (trimmed where allowed)."""
-        return await self.context.assemble(
-            self.short_term,
-            allow_trim=turn == 1 or not self._binds_reasoning,
-        )
+        """The view for this run's *turn*-th call. The context manager decides
+        whether it may be trimmed: on a model that binds reasoning to the
+        prefix, only at a run's first call."""
+        return await self.context.assemble(self.short_term, call=turn)
 
     def _window_exceeded(
         self, estimated_tokens: int, turn_num: int
@@ -653,7 +649,7 @@ class AgentLoop:
             ) as run_span:
                 memory = self.short_term.copy() if self.retain_history else ShortTermMemory()
                 await self._begin_run(user_input, memory)
-                assembled = await self.context.assemble(memory, allow_trim=True, dry_run=True)
+                assembled = await self.context.assemble(memory, call=1, dry_run=True)
                 report = _report(assembled, self.context.max_context_tokens, None)
                 run_span.update(stop_reason=StopReason.DRY_RUN.value, **report.to_dict())
                 return AgentResult(
@@ -1091,6 +1087,7 @@ def _report(assembled: AssembledContext, limit: int, usage: TokenUsage | None) -
         cleared_results=assembled.cleared_results,
         reasoning_dropped=assembled.reasoning_dropped,
         trimmed=assembled.trim is not None and assembled.trim.applied,
+        filtered=assembled.filtered,
         input_tokens=usage.input_tokens if usage is not None else 0,
         cache_read_tokens=usage.cache_read_input_tokens if usage is not None else 0,
         cache_write_tokens=usage.cache_creation_input_tokens if usage is not None else 0,

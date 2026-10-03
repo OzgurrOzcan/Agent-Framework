@@ -44,6 +44,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from agent_framework.core.config import AgentConfig, MemoryConfig
+from agent_framework.core.context_filter import ContextFilter
 from agent_framework.core.context_manager import ContextManager
 from agent_framework.core.loop import AgentLoop, AgentResult
 from agent_framework.core.message import AnyMessage, message_from_dict
@@ -123,6 +124,7 @@ class Agent:
         mcp: MCPServerRegistry | None = None,
         memory_backend: LongTermBackend | None = None,
         session_id: str | None = None,
+        context_filter: ContextFilter | None = None,
         trace: ExecutionTrace | None = None,
         pricing: PricingTable | None = None,
         agent_id: str | None = None,
@@ -155,6 +157,10 @@ class Agent:
                 `store`.
             session_id: which conversation this agent saves and resumes.
                 Defaults to a fresh id per agent; it is recorded in the trace.
+            context_filter: ``fn(messages, info) -> messages`` (sync or
+                async), called before every LLM call to change what is sent —
+                never what is stored (advanced; see
+                `agent_framework.core.context_filter`).
             trace, pricing: injected subsystems; sensible defaults are
                 built when omitted.
             agent_id: stable id for traces; generated when omitted.
@@ -178,6 +184,12 @@ class Agent:
         _validate_memory(self.config.memory, memory_backend)
         if session_id is not None and (not isinstance(session_id, str) or not session_id.strip()):
             raise ValueError(f"session_id must be a non-empty string, got {session_id!r}")
+        if context_filter is not None and not callable(context_filter):
+            raise TypeError(
+                "context_filter must be a function (messages, info) -> messages, got "
+                f"{type(context_filter).__name__}"
+            )
+        self._context_filter = context_filter
 
         # Copy the tools: registering `ask_user` (and later the MCP tools)
         # must not reach into a registry the caller may share between agents.
@@ -252,6 +264,9 @@ class Agent:
             tools=registry,
             memory=self._memory,
             trace=self._trace,
+            context_filter=context_filter,
+            binds_reasoning=self.config.reasoning_binds_to_prefix,
+            model=self.config.model,
         )
         self._checkpoints: dict[CheckpointId, dict[str, Any]] = {}
         self._native_clearing = _native_clearing_available(self.config, self._provider)
@@ -531,6 +546,12 @@ class Agent:
                 else None
             ),
             native_tool_result_clearing=self._native_clearing,
+            reasoning_binds_to_prefix=self.config.reasoning_binds_to_prefix,
+            context_filter=(
+                getattr(self._context_filter, "__qualname__", type(self._context_filter).__name__)
+                if self._context_filter is not None
+                else None
+            ),
         )
         self._trace.record_event(EventType.SESSION, name="session", payload=payload)
 

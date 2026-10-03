@@ -44,7 +44,9 @@ the head of the view.
 from __future__ import annotations
 
 import bisect
+import copy
 import dataclasses
+import inspect
 import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -58,9 +60,19 @@ from agent_framework.core.message import (
     estimate_message_tokens,
     estimate_tokens,
 )
+from agent_framework.core.context_filter import (
+    ContextFilter,
+    ContextInfo,
+    FilterOutcome,
+    current_turn_start,
+    repair,
+    same_messages,
+    validate_output,
+    without_reasoning_before,
+)
 from agent_framework.memory.short_term import ContextState, ShortTermMemory
 from agent_framework.tools.builtin.ask_user import ASK_USER_TOOL_NAME
-from agent_framework.tracing.trace import EventType, ExecutionTrace
+from agent_framework.tracing.trace import EventType, ExecutionTrace, SpanStatus
 
 if TYPE_CHECKING:
     from agent_framework.memory.manager import MemoryManager
@@ -151,6 +163,8 @@ class AssembledContext:
     cleared_results: int = 0
     # Assistant messages whose reasoning this view leaves out.
     reasoning_dropped: int = 0
+    # Whether a context_filter changed what is sent.
+    filtered: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,6 +183,8 @@ class ContextReport:
     cleared_results: int
     reasoning_dropped: int
     trimmed: bool
+    # Whether a context_filter changed what is sent.
+    filtered: bool = False
     # Provider-reported; zero until the call has been made.
     input_tokens: int = 0
     cache_read_tokens: int = 0
@@ -189,6 +205,7 @@ class ContextReport:
             "cleared_results": self.cleared_results,
             "reasoning_dropped": self.reasoning_dropped,
             "trimmed": self.trimmed,
+            "filtered": self.filtered,
             "input_tokens": self.input_tokens,
             "cache_read_tokens": self.cache_read_tokens,
             "cache_write_tokens": self.cache_write_tokens,
@@ -232,6 +249,9 @@ class ContextManager:
         tools: ToolRegistry | None = None,
         memory: MemoryManager | None = None,
         trace: ExecutionTrace | None = None,
+        context_filter: ContextFilter | None = None,
+        binds_reasoning: bool = False,
+        model: str = "",
     ) -> None:
         if max_context_tokens < 1 or max_tool_result_tokens < 1:
             raise ValueError("max_context_tokens and max_tool_result_tokens must be >= 1")
@@ -252,6 +272,17 @@ class ContextManager:
         self._summary_cache: tuple[tuple[str, ...], UserMessage] | None = None
         # (epoch, tokens) the provider cleared server-side at the last call.
         self._provider_cleared: tuple[int, int] = (0, 0)
+        self._filter = context_filter
+        # Reasoning is invalidated by editing earlier messages: nothing
+        # already sent may change mid-run, so trims wait for a run's start.
+        self._binds_reasoning = binds_reasoning
+        self._model = model
+        # What the last call actually sent, and the view it was made from —
+        # with a filter, the two differ, and the sent one is what the
+        # model's reasoning is bound to.
+        self._last_sent: list[AnyMessage] | None = None
+        self._last_view_len = 0
+        self._last_epoch = 0
 
     # ------------------------------------------------------------ properties
     @property
@@ -469,47 +500,179 @@ class ContextManager:
         self,
         memory: ShortTermMemory,
         *,
-        allow_trim: bool = True,
+        call: int = 1,
         dry_run: bool = False,
     ) -> AssembledContext:
-        """Render the view for the next call, trimming *memory* first if needed.
+        """Render what the run's *call*-th LLM call sends, trimming first if needed.
 
-        A trim mutates *memory* (pass a copy to look without touching).
-        `allow_trim=False` renders as-is even above the limit — for models that
-        bind reasoning to the prefix, in the middle of a run. `dry_run=True`
-        is for looking only: no call follows, so this manager's own state
-        (the token anchor, the once-only trim record) is left alone and trim
-        events are marked `dry_run`.
+        On models that bind reasoning to the prefix the history is trimmed
+        only at a run's first call; in the middle of a run it is rendered
+        as-is even above the limit (the pre-flight guard and server-side
+        clearing take over there). A trim
+        mutates *memory* (pass a copy to look without touching).
+        `dry_run=True` is for looking only: no call follows, so this
+        manager's own state (the token anchor, the once-only trim record, the
+        last sent view) is left alone and trim events are marked `dry_run`.
         """
+        run_start = call == 1
         stats = _RenderStats()
         view = self.render_view(memory.snapshot(), memory.state, stats)
         estimated = self.estimate(memory, view)
 
         trim: TrimOutcome | None = None
-        if allow_trim and estimated > self._limit:
+        if (run_start or not self._binds_reasoning) and estimated > self._limit:
             trim = self._trim(memory, estimated, dry_run=dry_run)
             if trim.applied:
                 stats = _RenderStats()
                 view = self.render_view(memory.snapshot(), memory.state, stats)
                 estimated = trim.estimated_after
 
+        sent, filtered = view, False
+        if self._filter is not None:
+            info = ContextInfo(
+                call=call,
+                run_start=run_start,
+                estimated_tokens=estimated,
+                max_context_tokens=self._limit,
+                model=self._model,
+                reasoning_binds_to_prefix=self._binds_reasoning,
+                trimmed=trim is not None and trim.applied,
+            )
+            sent = await self._apply_filter(memory, view, info, dry_run=dry_run)
+            filtered = not same_messages(sent, view)
+            if filtered:
+                estimated = self._calibrated(self._system_raw + self._tools_raw() + _raw(sent))
+
         if not dry_run:
             tools_raw = self._tools_raw()
             self._pending = _PendingCall(
-                epoch=memory.epoch,
+                # A filtered view is not the rendered one the next call extends,
+                # so it cannot anchor that call's estimate.
+                epoch=-1 if filtered else memory.epoch,
                 view_len=len(view),
-                raw_total=self._system_raw + tools_raw + _raw(view),
+                raw_total=self._system_raw + tools_raw + _raw(sent),
                 tools_raw=tools_raw,
             )
+            if self._filter is not None:
+                self._last_sent, self._last_view_len = sent, len(view)
+                self._last_epoch = memory.epoch
         return AssembledContext(
             system_prompt=self._system_prompt,
-            messages=view,
+            messages=sent,
             estimated_tokens=estimated,
             trim=trim,
             messages_stored=len(memory),
             cleared_results=stats.cleared_results,
             reasoning_dropped=stats.reasoning_dropped,
+            filtered=filtered,
         )
+
+    # -------------------------------------------------------- context filter
+    async def _apply_filter(
+        self,
+        memory: ShortTermMemory,
+        view: list[AnyMessage],
+        info: ContextInfo,
+        *,
+        dry_run: bool,
+    ) -> list[AnyMessage]:
+        """Run the filter, repair its output, and keep the sent prefix intact."""
+        assert self._filter is not None
+        outcome = FilterOutcome()
+        candidate = view
+        try:
+            result = self._filter([copy.copy(m) for m in view], info)
+            if inspect.isawaitable(result):
+                result = await result
+            candidate, outcome.repairs = repair(validate_output(result))
+        except Exception as exc:
+            # Errors are feedback, never crashes: the unfiltered view is sent.
+            outcome.error = f"{type(exc).__name__}: {exc}"
+            candidate = view
+        if self._binds_reasoning:
+            candidate = self._guard_prefix(memory, view, candidate, info.run_start, outcome)
+        outcome.changed = not same_messages(candidate, view)
+        self._record_filter(outcome, dry_run=dry_run)
+        return candidate
+
+    def _guard_prefix(
+        self,
+        memory: ShortTermMemory,
+        view: list[AnyMessage],
+        candidate: list[AnyMessage],
+        run_start: bool,
+        outcome: FilterOutcome,
+    ) -> list[AnyMessage]:
+        """Keep reasoning valid on a model that binds it to the prefix.
+
+        Its reasoning blocks were produced against what was actually *sent*,
+        so the reference is the last sent view extended by everything stored
+        since — the model's own new output included. A candidate that keeps
+        all of that unchanged is fine. Otherwise: at a run's start the
+        reasoning before the current turn is left out (removing a leading run
+        of blocks keeps the rest valid); in the middle of a run the edit is
+        rejected and the reference itself is sent.
+        """
+        reference = self._sent_so_far(memory, view)
+        if reference is not None:
+            sent, appended = reference
+            frozen = len(sent) + _through_last_assistant(appended)
+            expected = (sent + appended)[:frozen]
+            if same_messages(candidate[:frozen], expected):
+                return candidate
+            if not run_start:
+                outcome.rejected = True
+                return sent + appended
+        stripped, count = without_reasoning_before(candidate, current_turn_start(candidate))
+        outcome.reasoning_stripped = count
+        return stripped
+
+    def _sent_so_far(
+        self, memory: ShortTermMemory, view: list[AnyMessage]
+    ) -> tuple[list[AnyMessage], list[AnyMessage]] | None:
+        """(last sent view, messages appended since) — None if not comparable."""
+        if self._last_sent is None or self._last_epoch != memory.epoch:
+            return None
+        if len(view) < self._last_view_len:
+            return None
+        return self._last_sent, view[self._last_view_len :]
+
+    def _record_filter(self, outcome: FilterOutcome, *, dry_run: bool) -> None:
+        if self._trace is None:
+            return
+        extra = {"dry_run": True} if dry_run else {}
+        if outcome.error is not None:
+            self._trace.record_event(
+                EventType.ERROR,
+                name="context_filter_error",
+                status=SpanStatus.ERROR,
+                payload={"error": outcome.error[:500], "fallback": "unfiltered view", **extra},
+            )
+        if outcome.rejected:
+            self._trace.record_event(
+                EventType.ERROR,
+                name="context_filter_rejected",
+                status=SpanStatus.ERROR,
+                payload={
+                    "reason": (
+                        "the filter changed messages already sent to a model that "
+                        "binds reasoning to the prefix, in the middle of a run"
+                    ),
+                    "fallback": "last sent view + new messages",
+                    **extra,
+                },
+            )
+        if outcome.changed or outcome.repairs.any() or outcome.reasoning_stripped:
+            self._trace.record_event(
+                EventType.COMPACTION,
+                name="context_filter",
+                payload={
+                    "changed": outcome.changed,
+                    **outcome.repairs.to_dict(),
+                    "reasoning_stripped": outcome.reasoning_stripped,
+                    **extra,
+                },
+            )
 
     # ----------------------------------------------------------------- trim
     def _trim(
@@ -673,6 +836,14 @@ def _turn_starts(history: list[AnyMessage]) -> list[int]:
         for i, message in enumerate(history)
         if _is_user_turn(message) and (i == 0 or not _is_user_turn(history[i - 1]))
     ]
+
+
+def _through_last_assistant(messages: list[AnyMessage]) -> int:
+    """Length of the prefix of *messages* up to its last assistant message."""
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], AssistantMessage):
+            return index + 1
+    return 0
 
 
 def _first_user_message(messages: list[AnyMessage]) -> tuple[int, AnyMessage | None]:
