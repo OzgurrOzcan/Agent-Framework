@@ -1,8 +1,10 @@
-"""SQLiteBackend — default zero-config persistent backend.
+"""SQLiteBackend — the default zero-config persistent backend.
 
-Single file, durable, no external deps. Uses `aiosqlite`-style access
-through a thread pool (asyncio.to_thread) to keep the API uniform with the
-async base class without adding a hard dependency.
+One file, durable, no external dependency. All access goes through a single
+connection, serialized by a lock and run in a worker thread
+(`asyncio.to_thread`), so the async API never blocks the event loop and an
+in-memory database (``":memory:"``) keeps its data for the backend's
+lifetime. `close()` releases the connection and is idempotent.
 """
 
 from __future__ import annotations
@@ -11,12 +13,14 @@ import asyncio
 import json
 import sqlite3
 import threading
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import TypeVar
 
 from agent_framework.memory.backends.base import Fact, LongTermBackend
 
+_T = TypeVar("_T")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -42,29 +46,60 @@ CREATE TABLE IF NOT EXISTS summaries (
 class SQLiteBackend(LongTermBackend):
     def __init__(self, path: str | Path = "agent_memory.db") -> None:
         self._path = str(path)
-        self._lock = threading.RLock()
-        self._ensure_schema()
+        self._lock = threading.Lock()
+        self._conn: sqlite3.Connection | None = self._open()
 
-    # ----- sync core (runs inside to_thread) -----
-    def _connect(self) -> sqlite3.Connection:
+    @property
+    def path(self) -> str:
+        return self._path
+
+    @property
+    def closed(self) -> bool:
+        return self._conn is None
+
+    # ----- connection -----
+    def _open(self) -> sqlite3.Connection:
+        # check_same_thread=False: the connection is used from worker
+        # threads, one at a time under `_lock`.
         conn = sqlite3.connect(self._path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        # WAL lets readers in other processes proceed while one writes; a
+        # busy timeout makes a concurrent writer wait instead of failing.
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        with conn:
+            conn.executescript(_SCHEMA)
         return conn
 
-    def _ensure_schema(self) -> None:
-        with self._lock, self._connect() as conn:
-            conn.executescript(_SCHEMA)
-            conn.commit()
+    def _run(self, work: Callable[[sqlite3.Connection], _T]) -> _T:
+        """Run *work* on the connection, in one transaction, under the lock."""
+        with self._lock:
+            if self._conn is None:
+                raise RuntimeError(
+                    f"SQLiteBackend({self._path!r}) is closed; build a new backend "
+                    "(or a new agent) to use the store again."
+                )
+            with self._conn:  # commits on success, rolls back on error
+                return work(self._conn)
 
-    def _put(self, fact: Fact) -> None:
-        with self._lock, self._connect() as conn:
-            now = datetime.now(timezone.utc).isoformat()
-            existing = conn.execute(
-                "SELECT created_at FROM facts WHERE namespace=? AND key=?",
-                (fact.namespace, fact.key),
-            ).fetchone()
-            created_at = existing["created_at"] if existing else now
+    async def _call(self, work: Callable[[sqlite3.Connection], _T]) -> _T:
+        return await asyncio.to_thread(self._run, work)
+
+    async def close(self) -> None:
+        """Close the connection. Safe to call more than once."""
+
+        def _close() -> None:
+            with self._lock:
+                if self._conn is not None:
+                    self._conn.close()
+                    self._conn = None
+
+        await asyncio.to_thread(_close)
+
+    # ----- facts -----
+    async def put_fact(self, fact: Fact) -> None:
+        def work(conn: sqlite3.Connection) -> None:
+            now = _now()
             conn.execute(
                 """
                 INSERT INTO facts(namespace, key, value, tags, created_at, updated_at)
@@ -74,82 +109,26 @@ class SQLiteBackend(LongTermBackend):
                     tags=excluded.tags,
                     updated_at=excluded.updated_at
                 """,
-                (
-                    fact.namespace,
-                    fact.key,
-                    fact.value,
-                    json.dumps(list(fact.tags)),
-                    created_at,
-                    now,
-                ),
+                (fact.namespace, fact.key, fact.value, json.dumps(list(fact.tags)), now, now),
             )
-            conn.commit()
 
-    def _get(self, namespace: str, key: str) -> Fact | None:
-        with self._lock, self._connect() as conn:
+        await self._call(work)
+
+    async def get_fact(self, key: str, namespace: str = "default") -> Fact | None:
+        def work(conn: sqlite3.Connection) -> Fact | None:
             row = conn.execute(
                 "SELECT * FROM facts WHERE namespace=? AND key=?", (namespace, key)
             ).fetchone()
             return _row_to_fact(row) if row else None
 
-    def _delete(self, namespace: str, key: str) -> None:
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                "DELETE FROM facts WHERE namespace=? AND key=?", (namespace, key)
-            )
-            conn.commit()
-
-    def _search(
-        self,
-        namespace: str,
-        query: str | None,
-        tags: list[str],
-        limit: int,
-    ) -> list[Fact]:
-        with self._lock, self._connect() as conn:
-            sql = "SELECT * FROM facts WHERE namespace=?"
-            params: list[object] = [namespace]
-            if query:
-                sql += " AND (LOWER(key) LIKE ? OR LOWER(value) LIKE ?)"
-                pat = f"%{query.lower()}%"
-                params.extend([pat, pat])
-            if tags:
-                for t in tags:
-                    sql += " AND tags LIKE ?"
-                    params.append(f'%"{t}"%')
-            sql += " ORDER BY updated_at DESC LIMIT ?"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
-            return [_row_to_fact(r) for r in rows]
-
-    def _set_summary(self, namespace: str, summary: str) -> None:
-        with self._lock, self._connect() as conn:
-            now = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                """
-                INSERT INTO summaries(namespace, summary, updated_at) VALUES (?, ?, ?)
-                ON CONFLICT(namespace) DO UPDATE SET summary=excluded.summary, updated_at=excluded.updated_at
-                """,
-                (namespace, summary, now),
-            )
-            conn.commit()
-
-    def _get_summary(self, namespace: str) -> str:
-        with self._lock, self._connect() as conn:
-            row = conn.execute(
-                "SELECT summary FROM summaries WHERE namespace=?", (namespace,)
-            ).fetchone()
-            return row["summary"] if row else ""
-
-    # ----- async surface -----
-    async def put_fact(self, fact: Fact) -> None:
-        await asyncio.to_thread(self._put, fact)
-
-    async def get_fact(self, key: str, namespace: str = "default") -> Fact | None:
-        return await asyncio.to_thread(self._get, namespace, key)
+        return await self._call(work)
 
     async def delete_fact(self, key: str, namespace: str = "default") -> None:
-        await asyncio.to_thread(self._delete, namespace, key)
+        await self._call(
+            lambda conn: conn.execute(
+                "DELETE FROM facts WHERE namespace=? AND key=?", (namespace, key)
+            )
+        )
 
     async def search_facts(
         self,
@@ -159,18 +138,52 @@ class SQLiteBackend(LongTermBackend):
         namespace: str = "default",
         limit: int = 20,
     ) -> list[Fact]:
-        return await asyncio.to_thread(
-            self._search, namespace, query, list(tags or []), limit
-        )
+        tag_list = list(tags or [])
+
+        def work(conn: sqlite3.Connection) -> list[Fact]:
+            sql = "SELECT * FROM facts WHERE namespace=?"
+            params: list[object] = [namespace]
+            if query:
+                sql += " AND (LOWER(key) LIKE ? OR LOWER(value) LIKE ?)"
+                pattern = f"%{query.lower()}%"
+                params.extend([pattern, pattern])
+            for tag in tag_list:
+                sql += " AND tags LIKE ?"
+                params.append(f'%"{tag}"%')
+            sql += " ORDER BY updated_at DESC LIMIT ?"
+            params.append(limit)
+            return [_row_to_fact(r) for r in conn.execute(sql, params).fetchall()]
+
+        return await self._call(work)
 
     async def list_facts(self, namespace: str = "default", limit: int = 200) -> list[Fact]:
-        return await asyncio.to_thread(self._search, namespace, None, [], limit)
+        return await self.search_facts(namespace=namespace, limit=limit)
 
+    # ----- summary -----
     async def set_summary(self, namespace: str, summary: str) -> None:
-        await asyncio.to_thread(self._set_summary, namespace, summary)
+        await self._call(
+            lambda conn: conn.execute(
+                """
+                INSERT INTO summaries(namespace, summary, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(namespace) DO UPDATE SET
+                    summary=excluded.summary, updated_at=excluded.updated_at
+                """,
+                (namespace, summary, _now()),
+            )
+        )
 
     async def get_summary(self, namespace: str) -> str:
-        return await asyncio.to_thread(self._get_summary, namespace)
+        def work(conn: sqlite3.Connection) -> str:
+            row = conn.execute(
+                "SELECT summary FROM summaries WHERE namespace=?", (namespace,)
+            ).fetchone()
+            return row["summary"] if row else ""
+
+        return await self._call(work)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _row_to_fact(row: sqlite3.Row) -> Fact:

@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from agent_framework.memory.long_term import LongTermMemory
 from agent_framework.memory.short_term import ShortTermMemory
+
+if TYPE_CHECKING:
+    from agent_framework.tracing.trace import ExecutionTrace
 
 # Letters and digits of any script; underscores separate words in keys.
 _WORD_RX = re.compile(r"[^\W_]+")
@@ -33,10 +36,25 @@ class MemoryManager:
         short_term: ShortTermMemory | None = None,
         long_term: LongTermMemory | None = None,
         recent_query_limit: int = 8,
+        owns_backend: bool = False,
+        trace: ExecutionTrace | None = None,
     ) -> None:
         self.short_term = short_term or ShortTermMemory()
         self.long_term = long_term
         self.recent_query_limit = recent_query_limit
+        # True when this manager built its backend (from MemoryConfig.store)
+        # and so must close it; a backend passed in belongs to the caller.
+        self._owns_backend = owns_backend
+        self._trace = trace
+
+    async def close(self) -> None:
+        """Release the long-term store (the SQLite connection). Idempotent.
+
+        A backend passed as `Agent(memory_backend=...)` is left open: it
+        belongs to the caller, who may share it between agents.
+        """
+        if self.long_term is not None and self._owns_backend:
+            await self.long_term.backend.close()
 
     # ---- relevant context (Step 4 of context assembly) ----
     async def relevant_facts(self, current_user_input: str) -> list[dict[str, Any]]:
@@ -69,8 +87,25 @@ class MemoryManager:
     async def remember(
         self, key: str, value: str, *, tags: Iterable[str] = ()
     ) -> None:
+        """Store a fact in long-term memory (no-op without one)."""
         if self.long_term is not None:
             await self.long_term.remember(key, value, tags=tags)
+            self._record_write("remember", key=key)
+
+    async def forget(self, key: str) -> None:
+        """Remove a fact from long-term memory (no-op without one)."""
+        if self.long_term is not None:
+            await self.long_term.forget(key)
+            self._record_write("forget", key=key)
+
+    def _record_write(self, name: str, **payload: Any) -> None:
+        if self._trace is not None:
+            from agent_framework.tracing.trace import EventType
+
+            namespace = self.long_term.namespace if self.long_term is not None else None
+            self._trace.record_event(
+                EventType.MEMORY_WRITE, name=name, payload={"namespace": namespace, **payload}
+            )
 
     async def fold_into_summary(self, addition: str) -> None:
         if self.long_term is not None and addition.strip():

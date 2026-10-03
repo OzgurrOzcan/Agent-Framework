@@ -187,7 +187,7 @@ def test_long_term_fields_require_a_store(memory, field):
     assert "store=" in str(exc.value)
 
 
-def test_long_term_fields_are_accepted_with_a_store_or_a_backend(tmp_path):
+async def test_long_term_fields_are_accepted_with_a_store_or_a_backend(tmp_path):
     with_store = Agent(
         "claude-opus-5",
         api_key="k",
@@ -201,6 +201,7 @@ def test_long_term_fields_are_accepted_with_a_store_or_a_backend(tmp_path):
     )
     assert with_store.memory.long_term.namespace == "customer-42"
     assert isinstance(with_backend.memory.long_term.backend, InMemoryBackend)
+    await with_store.memory.close()
 
 
 @pytest.mark.parametrize(

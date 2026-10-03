@@ -219,7 +219,7 @@ class Agent:
         # share — and interleave — one conversation.
         self.session_id = session_id or f"sess_{uuid.uuid4().hex[:16]}"
         self._memory_backend = memory_backend
-        self._memory = _build_memory(self.config.memory, memory_backend)
+        self._memory = _build_memory(self.config.memory, memory_backend, self._trace)
         self._permissions_cfg = perms
         self._renderer = renderer
         self._provider = provider if provider is not None else _build_provider(self.config)
@@ -676,19 +676,28 @@ def _validate_memory(memory: MemoryConfig | None, backend: LongTermBackend | Non
 
 
 def _build_memory(
-    memory: MemoryConfig | None, backend: LongTermBackend | None
+    memory: MemoryConfig | None,
+    backend: LongTermBackend | None,
+    trace: ExecutionTrace,
 ) -> MemoryManager:
-    """The agent's memory: short-term always, long-term when configured."""
+    """The agent's memory: short-term always, long-term when configured.
+
+    A stateless agent (no MemoryConfig) never opens a store. A store path
+    builds a SQLiteBackend that the manager owns — `await agent.memory.close()`
+    closes it; a backend passed in stays the caller's to close.
+    """
     if memory is None:
-        return MemoryManager()
+        return MemoryManager(trace=trace)
+    owns = False
     if backend is None and memory.store is not None:
         backend = SQLiteBackend(memory.store)
+        owns = True
     long_term = (
         LongTermMemory(backend=backend, namespace=memory.namespace)
         if backend is not None
         else None
     )
-    return MemoryManager(long_term=long_term)
+    return MemoryManager(long_term=long_term, owns_backend=owns, trace=trace)
 
 
 def _build_provider(config: AgentConfig) -> BaseProviderAdapter:
