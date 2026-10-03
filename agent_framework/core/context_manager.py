@@ -76,6 +76,7 @@ from agent_framework.tracing.trace import EventType, ExecutionTrace, SpanStatus
 
 if TYPE_CHECKING:
     from agent_framework.memory.manager import MemoryManager
+    from agent_framework.memory.summaries import Summarizer
     from agent_framework.tools.registry import ToolRegistry
 
 
@@ -252,6 +253,7 @@ class ContextManager:
         context_filter: ContextFilter | None = None,
         binds_reasoning: bool = False,
         model: str = "",
+        summarizer: Summarizer | None = None,
     ) -> None:
         if max_context_tokens < 1 or max_tool_result_tokens < 1:
             raise ValueError("max_context_tokens and max_tool_result_tokens must be >= 1")
@@ -273,6 +275,9 @@ class ContextManager:
         # (epoch, tokens) the provider cleared server-side at the last call.
         self._provider_cleared: tuple[int, int] = (0, 0)
         self._filter = context_filter
+        # Long-term summaries (a store that keeps sessions): what a trim drops
+        # is summarized, and a new conversation starts with the summary.
+        self._summarizer = summarizer
         # Reasoning is invalidated by editing earlier messages: nothing
         # already sent may change mid-run, so trims wait for a run's start.
         self._binds_reasoning = binds_reasoning
@@ -458,25 +463,36 @@ class ContextManager:
         return cleared if epoch == memory.epoch else 0
 
     # ------------------------------------------------------------- assembly
-    async def start_run(self, memory: ShortTermMemory, user_input: str) -> None:
+    async def start_run(
+        self, memory: ShortTermMemory, user_input: str, *, dry_run: bool = False
+    ) -> None:
         """Store this run's memory context in the history, once.
 
         Called at the start of a run, before the user's message is appended.
-        A new conversation (empty history) takes a snapshot of the long-term
+        A new conversation (empty history) first lets the newest idle session
+        of the namespace be summarized, then takes a snapshot of the long-term
         summary into the state; facts relevant to *user_input* are appended as
         one message — part of the history from then on, so every call of the
         run sends exactly the same prefix. Facts already present in the
-        history are not repeated.
+        history are not repeated. A dry run reads but never summarizes.
         """
         if self._memory is None or self._memory.long_term is None:
             return
         if len(memory) == 0 and memory.state.pinned is None:
-            summary = await self._memory.rolling_summary()
-            if summary:
+            if self._summarizer is not None:
+                if not dry_run:
+                    await self._summarizer.on_conversation_start()
+                segments = await self._summarizer.segments()
+            else:
+                legacy = await self._memory.rolling_summary()
+                segments = [legacy] if legacy else []
+            if segments:
                 state = memory.state.copy()
-                state.summary = [summary]
+                state.summary = segments
                 memory.state = state
-                self._record_memory_read("summary", chars=len(summary))
+                self._record_memory_read(
+                    "summary", segments=len(segments), chars=sum(len(s) for s in segments)
+                )
         facts = await self._memory.relevant_facts(user_input)
         seen = _injected_facts(memory.snapshot())
         new = [f for f in facts if (f.get("key"), f.get("value")) not in seen]
@@ -521,11 +537,14 @@ class ContextManager:
 
         trim: TrimOutcome | None = None
         if (run_start or not self._binds_reasoning) and estimated > self._limit:
-            trim = self._trim(memory, estimated, dry_run=dry_run)
+            trim, summary_changed = await self._trim(memory, estimated, dry_run=dry_run)
             if trim.applied:
                 stats = _RenderStats()
                 view = self.render_view(memory.snapshot(), memory.state, stats)
                 estimated = trim.estimated_after
+                if summary_changed:
+                    # The summary at the head changed too: measure it all again.
+                    estimated = self._calibrated(self._system_raw + self._tools_raw() + _raw(view))
 
         sent, filtered = view, False
         if self._filter is not None:
@@ -675,16 +694,24 @@ class ContextManager:
             )
 
     # ----------------------------------------------------------------- trim
-    def _trim(
+    async def _trim(
         self, memory: ShortTermMemory, estimated_before: int, *, dry_run: bool = False
-    ) -> TrimOutcome:
+    ) -> tuple[TrimOutcome, bool]:
+        """Plan and apply a trim: ``(outcome, summary_changed)``.
+
+        With long-term summaries, the turns it drops are summarized right
+        away (one LLM call; never on a dry run).
+        """
         state, drop, outcome = self.plan_trim(memory.snapshot(), memory.state, estimated_before)
+        summary_changed = False
         if outcome.applied:
             memory.state = state
-            memory.drop_head(drop)
+            dropped = memory.drop_head(drop)
+            self._record(outcome, dry_run=dry_run)
             if not dry_run:
                 self._noop_epoch = None
-            self._record(outcome, dry_run=dry_run)
+                if self._summarizer is not None and dropped:
+                    summary_changed = await self._summarizer.after_trim(memory, dropped)
         elif dry_run:
             self._record(outcome, dry_run=True)
         elif self._noop_epoch != memory.epoch:
@@ -692,7 +719,7 @@ class ContextManager:
             # every following call until something is removed or replaced.
             self._noop_epoch = memory.epoch
             self._record(outcome)
-        return outcome
+        return outcome, summary_changed
 
     def _record(self, outcome: TrimOutcome, *, dry_run: bool = False) -> None:
         if self._trace is not None:
@@ -732,12 +759,11 @@ class ContextManager:
 
         # Whatever changes from here on, reasoning before the current turn goes
         # with it: its signatures cover the prefix being edited.
-        candidate = ContextState(
-            pinned=state.pinned,
-            cleared_results=cleared_zone,
-            reasoning_cut=max(state.reasoning_cut, current_turn),
-            summary=list(state.summary),
-        )
+        # A copy, so whatever else the state carries (summary, pending
+        # summaries) survives the trim.
+        candidate = state.copy()
+        candidate.cleared_results = cleared_zone
+        candidate.reasoning_cut = max(state.reasoning_cut, current_turn)
         tokens = [estimate_message_tokens(m) for m in self._render_history(history, candidate)]
         suffix = [0] * (len(tokens) + 1)
         for i in range(len(tokens) - 1, -1, -1):

@@ -200,15 +200,22 @@ class AgentLoop:
             )
         self._running = True
 
-    async def _begin_run(self, user_input: str, memory: ShortTermMemory | None = None) -> None:
+    async def _begin_run(
+        self,
+        user_input: str,
+        memory: ShortTermMemory | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> None:
         """Start a run's history: fresh without memory, repaired with it, then
-        this run's memory context, then the user's message."""
+        this run's memory context, then the user's message. A dry run works
+        on a copy and never summarizes."""
         memory = memory if memory is not None else self.short_term
         if not self.retain_history:
             memory.clear()
         else:
             _answer_unanswered_calls(memory)
-        await self.context.start_run(memory, user_input)
+        await self.context.start_run(memory, user_input, dry_run=dry_run)
         memory.append(UserMessage(content=user_input))
 
     async def _assemble(self, turn: int) -> AssembledContext:
@@ -648,7 +655,7 @@ class AgentLoop:
                 },
             ) as run_span:
                 memory = self.short_term.copy() if self.retain_history else ShortTermMemory()
-                await self._begin_run(user_input, memory)
+                await self._begin_run(user_input, memory, dry_run=True)
                 assembled = await self.context.assemble(memory, call=1, dry_run=True)
                 report = _report(assembled, self.context.max_context_tokens, None)
                 run_span.update(stop_reason=StopReason.DRY_RUN.value, **report.to_dict())

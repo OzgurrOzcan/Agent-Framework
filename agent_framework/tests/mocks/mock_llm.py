@@ -95,6 +95,7 @@ class MockLLMProvider(BaseProviderAdapter):
     ) -> NormalizedResponse:
         turn = self._next_turn()
         self.call_log.append({
+            "model": model,
             "system": system[:100],
             "messages": list(messages),
             "message_count": len(messages),

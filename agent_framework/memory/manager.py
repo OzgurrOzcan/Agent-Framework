@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Iterable
 
 from agent_framework.memory.long_term import LongTermMemory
@@ -46,6 +47,23 @@ class MemoryManager:
         # and so must close it; a backend passed in belongs to the caller.
         self._owns_backend = owns_backend
         self._trace = trace
+        self._summarize: Callable[[], Awaitable[bool]] | None = None
+
+    def set_summarize(self, summarize: Callable[[], Awaitable[bool]]) -> None:
+        """Wire `summarize()` to the agent that owns this memory."""
+        self._summarize = summarize
+
+    async def summarize(self) -> bool:
+        """Summarize this conversation into long-term memory now.
+
+        Covers what the conversation added since its last summary — a short
+        conversation that never trimmed included — with one LLM call, and
+        returns True if a summary was written. Call it between runs; without
+        a long-term store it does nothing and returns False.
+        """
+        if self._summarize is None:
+            return False
+        return await self._summarize()
 
     async def close(self) -> None:
         """Release the long-term store (the SQLite connection). Idempotent.

@@ -19,7 +19,14 @@ from pathlib import Path
 from typing import TypeVar
 
 from agent_framework.memory.backends.base import Fact, LongTermBackend
-from agent_framework.memory.sessions import LogEntry, SessionRecord, SessionStore, encode
+from agent_framework.memory.sessions import (
+    IdleTail,
+    LogEntry,
+    SessionRecord,
+    SessionStore,
+    SummarySegment,
+    encode,
+)
 
 _T = TypeVar("_T")
 
@@ -67,6 +74,15 @@ CREATE TABLE IF NOT EXISTS session_state (
 );
 CREATE INDEX IF NOT EXISTS idx_session_state_updated
     ON session_state(namespace, updated_at DESC);
+
+-- A namespace's long-term summary, as a list of segments (oldest first).
+CREATE TABLE IF NOT EXISTS summary_segments (
+    namespace TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (namespace, seq)
+);
 """
 
 
@@ -98,8 +114,13 @@ class SQLiteBackend(LongTermBackend, SessionStore):
             conn.executescript(_SCHEMA)
         return conn
 
-    def _run(self, work: Callable[[sqlite3.Connection], _T]) -> _T:
-        """Run *work* on the connection, in one transaction, under the lock."""
+    def _run(self, work: Callable[[sqlite3.Connection], _T], *, immediate: bool = False) -> _T:
+        """Run *work* on the connection, in one transaction, under the lock.
+
+        *immediate* takes the database's write lock up front (BEGIN
+        IMMEDIATE): for read-then-write steps that another process must not
+        interleave with, such as claiming a session's tail.
+        """
         with self._lock:
             if self._conn is None:
                 raise RuntimeError(
@@ -107,10 +128,14 @@ class SQLiteBackend(LongTermBackend, SessionStore):
                     "(or a new agent) to use the store again."
                 )
             with self._conn:  # commits on success, rolls back on error
+                if immediate:
+                    self._conn.execute("BEGIN IMMEDIATE")
                 return work(self._conn)
 
-    async def _call(self, work: Callable[[sqlite3.Connection], _T]) -> _T:
-        return await asyncio.to_thread(self._run, work)
+    async def _call(
+        self, work: Callable[[sqlite3.Connection], _T], *, immediate: bool = False
+    ) -> _T:
+        return await asyncio.to_thread(self._run, work, immediate=immediate)
 
     async def close(self) -> None:
         """Close the connection. Safe to call more than once."""
@@ -276,6 +301,123 @@ class SQLiteBackend(LongTermBackend, SessionStore):
             return [LogEntry(seq=r["seq"], message=json.loads(r["message"])) for r in rows]
 
         return await self._call(work)
+
+
+    # ----- the namespace's summary -----
+    async def summary_segments(self, namespace: str) -> list[SummarySegment]:
+        def work(conn: sqlite3.Connection) -> list[SummarySegment]:
+            rows = conn.execute(
+                "SELECT seq, text FROM summary_segments WHERE namespace=? ORDER BY seq",
+                (namespace,),
+            ).fetchall()
+            if rows:
+                return [SummarySegment(seq=r["seq"], text=r["text"]) for r in rows]
+            # A summary written before segments existed is the first one.
+            legacy = conn.execute(
+                "SELECT summary FROM summaries WHERE namespace=?", (namespace,)
+            ).fetchone()
+            return [SummarySegment(seq=0, text=legacy["summary"])] if legacy and legacy["summary"] else []
+
+        return await self._call(work)
+
+    async def append_summary(
+        self,
+        namespace: str,
+        text: str,
+        *,
+        session_id: str | None = None,
+        summarized_upto: int = 0,
+    ) -> None:
+        def work(conn: sqlite3.Connection) -> None:
+            now = _now()
+            last = conn.execute(
+                "SELECT MAX(seq) AS seq FROM summary_segments WHERE namespace=?", (namespace,)
+            ).fetchone()["seq"]
+            if last is None:
+                last = 0
+                legacy = conn.execute(
+                    "SELECT summary FROM summaries WHERE namespace=?", (namespace,)
+                ).fetchone()
+                if legacy and legacy["summary"]:
+                    last = 1
+                    conn.execute(
+                        "INSERT INTO summary_segments(namespace, seq, text, created_at) "
+                        "VALUES (?, 1, ?, ?)",
+                        (namespace, legacy["summary"], now),
+                    )
+            conn.execute(
+                "INSERT INTO summary_segments(namespace, seq, text, created_at) VALUES (?, ?, ?, ?)",
+                (namespace, last + 1, text, now),
+            )
+            if session_id is not None:
+                conn.execute(
+                    "UPDATE session_state SET summarized_upto=MAX(summarized_upto, ?) "
+                    "WHERE namespace=? AND session_id=?",
+                    (summarized_upto, namespace, session_id),
+                )
+
+        await self._call(work, immediate=True)
+
+    async def merge_summaries(
+        self, namespace: str, first_seq: int, second_seq: int, text: str
+    ) -> bool:
+        def work(conn: sqlite3.Connection) -> bool:
+            found = conn.execute(
+                "SELECT COUNT(*) AS n FROM summary_segments WHERE namespace=? AND seq IN (?, ?)",
+                (namespace, first_seq, second_seq),
+            ).fetchone()["n"]
+            if found != 2:
+                return False
+            conn.execute(
+                "DELETE FROM summary_segments WHERE namespace=? AND seq=?", (namespace, second_seq)
+            )
+            conn.execute(
+                "UPDATE summary_segments SET text=? WHERE namespace=? AND seq=?",
+                (text, namespace, first_seq),
+            )
+            return True
+
+        return await self._call(work, immediate=True)
+
+    async def claim_idle_session(
+        self, namespace: str, *, idle_before: str, exclude_session: str
+    ) -> IdleTail | None:
+        def work(conn: sqlite3.Connection) -> IdleTail | None:
+            row = conn.execute(
+                """
+                SELECT session_id, summarized_upto, last_seq FROM session_state
+                WHERE namespace=? AND session_id != ? AND updated_at < ?
+                  AND summarized_upto < last_seq
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (namespace, exclude_session, idle_before),
+            ).fetchone()
+            if row is None:
+                return None
+            claimed = conn.execute(
+                "UPDATE session_state SET summarized_upto=? "
+                "WHERE namespace=? AND session_id=? AND summarized_upto=?",
+                (row["last_seq"], namespace, row["session_id"], row["summarized_upto"]),
+            ).rowcount
+            if claimed != 1:
+                return None
+            return IdleTail(
+                session_id=row["session_id"],
+                after_seq=row["summarized_upto"],
+                upto_seq=row["last_seq"],
+            )
+
+        return await self._call(work, immediate=True)
+
+    async def release_claim(self, namespace: str, tail: IdleTail) -> None:
+        await self._call(
+            lambda conn: conn.execute(
+                "UPDATE session_state SET summarized_upto=? "
+                "WHERE namespace=? AND session_id=? AND summarized_upto=?",
+                (tail.after_seq, namespace, tail.session_id, tail.upto_seq),
+            ),
+            immediate=True,
+        )
 
 
 def _row_to_session(row: sqlite3.Row) -> SessionRecord:

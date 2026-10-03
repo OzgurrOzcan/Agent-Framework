@@ -62,9 +62,15 @@ from agent_framework.memory.sessions import (
     tool_set_fingerprint,
 )
 from agent_framework.memory.short_term import ContextState
+from agent_framework.memory.summaries import Summarizer
 from agent_framework.permissions.config import PermissionConfig
 from agent_framework.permissions.resolver import PermissionResolver
 from agent_framework.providers.base import BaseProviderAdapter, StreamChunk, ToolChoice
+from agent_framework.providers.catalog import (
+    ProviderResolutionError,
+    resolve_model,
+    split_model_id,
+)
 from agent_framework.tools.builtin.ask_user import ask_user_tool
 from agent_framework.tools.executor import ToolExecutor
 from agent_framework.tools.models import Tool
@@ -192,6 +198,7 @@ class Agent:
             memory=memory,
         )
         _validate_memory(self.config.memory, memory_backend)
+        self._summary_model = _summary_model(self.config)
         if session_id is not None and (not isinstance(session_id, str) or not session_id.strip()):
             raise ValueError(f"session_id must be a non-empty string, got {session_id!r}")
         if context_filter is not None and not callable(context_filter):
@@ -267,6 +274,25 @@ class Agent:
         # Built once: the prompt must stay byte-stable for prompt caching, and
         # the session span fingerprints exactly this text.
         self._system_prompt = self._build_system_prompt()
+        # Saved conversation, when the long-term store keeps sessions. Loaded
+        # once before the first run, saved after every run.
+        self._session = _build_session(self.config.memory, self._memory, self.session_id)
+        self._session_ready = self._session is None
+        self._session_lock = asyncio.Lock()
+        # Long-term summaries live next to the sessions they come from.
+        self._summarizer = (
+            Summarizer(
+                provider=self._provider,
+                model=self._summary_model,
+                session=self._session,
+                cost=self._cost,
+                trace=self._trace,
+                auto=self.config.memory.summarize if self.config.memory else False,
+            )
+            if self._session is not None
+            else None
+        )
+        self._memory.set_summarize(self._summarize_now)
         self._context_manager = ContextManager(
             system_prompt=self._system_prompt,
             max_context_tokens=self.config.resolved_max_context_tokens,
@@ -277,13 +303,9 @@ class Agent:
             context_filter=context_filter,
             binds_reasoning=self.config.reasoning_binds_to_prefix,
             model=self.config.model,
+            summarizer=self._summarizer,
         )
         self._checkpoints: dict[CheckpointId, dict[str, Any]] = {}
-        # Saved conversation, when the long-term store keeps sessions. Loaded
-        # once before the first run, saved after every run.
-        self._session = _build_session(self.config.memory, self._memory, self.session_id)
-        self._session_ready = self._session is None
-        self._session_lock = asyncio.Lock()
         self._native_clearing = _native_clearing_available(self.config, self._provider)
 
         self._record_session_span()
@@ -533,6 +555,16 @@ class Agent:
         self._cost.total_cost_usd = ckpt.get("cost", self._cost.total_cost_usd)
 
     # ===================== sessions =====================
+    async def _summarize_now(self) -> bool:
+        """`await agent.memory.summarize()`: save, then summarize what this
+        conversation added since its last summary (one LLM call, or none
+        when there is nothing new). False without long-term summaries."""
+        if self._summarizer is None:
+            return False
+        await self._ensure_session()
+        await self._flush_session()
+        return await self._summarizer.summarize_session()
+
     def _fingerprint(self) -> str:
         return tool_set_fingerprint(self._system_prompt, self._tools)
 
@@ -658,6 +690,7 @@ class Agent:
             ),
             native_tool_result_clearing=self._native_clearing,
             reasoning_binds_to_prefix=self.config.reasoning_binds_to_prefix,
+            summary_model=self._summary_model if self._summarizer is not None else None,
             context_filter=(
                 getattr(self._context_filter, "__qualname__", type(self._context_filter).__name__)
                 if self._context_filter is not None
@@ -809,6 +842,35 @@ def _build_memory(
         else None
     )
     return MemoryManager(long_term=long_term, owns_backend=owns, trace=trace)
+
+
+def _summary_model(config: AgentConfig) -> str:
+    """The model long-term summaries are written with (its wire name).
+
+    It is called through the agent's own adapter, so it must belong to the
+    agent's provider; a model of another provider is rejected here rather
+    than failing on the first summary.
+    """
+    requested = config.memory.summary_model if config.memory is not None else None
+    if requested is None:
+        return config.model
+    prefix, bare = split_model_id(requested)
+    if prefix is None:
+        try:
+            spec, bare = resolve_model(requested)
+        except ProviderResolutionError:
+            if config.provider == "openai" and config.base_url:
+                return bare  # an endpoint's own model name, as for the agent
+            raise
+        prefix = spec.name
+    if prefix != config.provider:
+        raise ValueError(
+            f"MemoryConfig.summary_model={requested!r} belongs to provider "
+            f"{prefix!r}, but this agent uses {config.provider!r}; summaries are "
+            "written through the agent's own connection. Pick a model of the "
+            "same provider (or leave summary_model unset)."
+        )
+    return bare
 
 
 def _build_session(

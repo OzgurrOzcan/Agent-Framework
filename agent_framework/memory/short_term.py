@@ -50,12 +50,15 @@ class ContextState:
         A snapshot, taken when the conversation starts (and refreshed only
         when a trim rebuilds the prefix anyway), so the view stays stable
         even while other sessions add to the same namespace.
+      - `pending`: turns a trim dropped whose summary failed; the next trim
+        summarizes them together with what it drops.
     """
 
     pinned: AnyMessage | None = None
     cleared_results: int = 0
     reasoning_cut: int = 0
     summary: list[str] = field(default_factory=list)
+    pending: list[AnyMessage] = field(default_factory=list)
 
     def copy(self) -> ContextState:
         return ContextState(
@@ -63,6 +66,7 @@ class ContextState:
             cleared_results=self.cleared_results,
             reasoning_cut=self.reasoning_cut,
             summary=list(self.summary),
+            pending=list(self.pending),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -71,6 +75,7 @@ class ContextState:
             "cleared_results": self.cleared_results,
             "reasoning_cut": self.reasoning_cut,
             "summary": list(self.summary),
+            "pending": [m.to_dict() for m in self.pending],
         }
 
     @classmethod
@@ -82,6 +87,11 @@ class ContextState:
             cleared_results=max(0, int(data.get("cleared_results") or 0)),
             reasoning_cut=max(0, int(data.get("reasoning_cut") or 0)),
             summary=[str(segment) for segment in data.get("summary") or []],
+            pending=[
+                message_from_dict(raw)
+                for raw in data.get("pending") or []
+                if isinstance(raw, dict)
+            ],
         )
 
 
@@ -145,10 +155,15 @@ class ShortTermMemory:
         self._state = value
         self._touch()
 
-    def take_unlogged_dropped(self) -> list[AnyMessage]:
-        """Hand over (and forget) the dropped messages not yet logged."""
-        taken, self._unlogged_dropped = self._unlogged_dropped, []
-        return taken
+    def unlogged_dropped(self) -> list[AnyMessage]:
+        """Messages a trim removed before they were logged, oldest first."""
+        return list(self._unlogged_dropped)
+
+    def forget_logged_dropped(self) -> None:
+        """Stop holding dropped messages that have been logged since."""
+        self._unlogged_dropped = [
+            m for m in self._unlogged_dropped if LOG_SEQ_KEY not in m.metadata
+        ]
 
     @property
     def epoch(self) -> int:
