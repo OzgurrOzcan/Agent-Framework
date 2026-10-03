@@ -14,6 +14,11 @@ Design laws enforced here:
   - Each loop iteration is its own `turn[N]` span in the trace tree.
   - `pause_turn` continues the loop; `refusal` and context-window overflows
     terminate it with their own stop reasons.
+  - Nothing already sent is edited in the middle of a run on a model that
+    binds reasoning to the prefix (see `ProviderSpec.binds_reasoning_to_prefix`):
+    the history is trimmed only at a run's first call there. A call that
+    would not fit the window stops the run with CONTEXT_EXCEEDED *before*
+    it is sent, instead of surfacing the provider's 400.
 """
 
 from __future__ import annotations
@@ -40,6 +45,7 @@ from agent_framework.core.message import (
 )
 from agent_framework.core.policy import (
     BudgetExceededError,
+    ContextWindowExceededError,
     LoopGuardError,
     LoopPolicy,
 )
@@ -159,6 +165,9 @@ class AgentLoop:
         self.agent_id = agent_id
         # False = stateless: each run starts from an empty history.
         self.retain_history = retain_history
+        # Editing already-sent messages mid-run would invalidate this model's
+        # reasoning, so it is only trimmed at a run's first call.
+        self._binds_reasoning = config.reasoning_binds_to_prefix
         # Concurrent runs would interleave into the same short-term memory.
         self._running = False
 
@@ -171,13 +180,47 @@ class AgentLoop:
             )
         self._running = True
 
-    def _begin_run(self, user_input: str) -> None:
-        """Start a run's history: fresh without memory, repaired with it."""
+    async def _begin_run(self, user_input: str) -> None:
+        """Start a run's history: fresh without memory, repaired with it, then
+        this run's memory context, then the user's message."""
         if not self.retain_history:
             self.short_term.clear()
         else:
             self._answer_unanswered_calls()
+        await self.context.start_run(self.short_term, user_input)
         self.short_term.append(UserMessage(content=user_input))
+
+    async def _assemble(self, turn: int):
+        """The view for this run's *turn*-th call (trimmed where allowed)."""
+        return await self.context.assemble(
+            self.short_term,
+            allow_trim=turn == 1 or not self._binds_reasoning,
+        )
+
+    def _window_exceeded(self, estimated_tokens: int, turn_num: int) -> ContextWindowExceededError | None:
+        """The pre-flight guard: a prompt that cannot fit is never sent."""
+        usable = self.config.usable_context_tokens
+        if estimated_tokens <= usable:
+            return None
+        self.trace.record_event(
+            EventType.LOOP_GUARD,
+            name="context_exceeded",
+            status=SpanStatus.ERROR,
+            turn_number=turn_num,
+            payload={
+                "estimated_tokens": estimated_tokens,
+                "usable_tokens": usable,
+                "max_context_tokens": self.context.max_context_tokens,
+            },
+        )
+        return ContextWindowExceededError(
+            f"the prompt (≈{estimated_tokens} tokens) would not fit the "
+            f"{usable} tokens the context window leaves next to "
+            f"max_tokens_per_response",
+            turn=turn_num,
+            estimated_tokens=estimated_tokens,
+            limit=usable,
+        )
 
     def _answer_unanswered_calls(self) -> None:
         """Give tool calls left without results a result before going on.
@@ -264,7 +307,7 @@ class AgentLoop:
         policy: LoopPolicy,
     ) -> AgentResult:
         state = LoopState()
-        self._begin_run(user_input)
+        await self._begin_run(user_input)
 
         stop_reason = StopReason.END_TURN
         try:
@@ -292,10 +335,10 @@ class AgentLoop:
                 ) as turn_span:
                     # Render what is sent; trims the history first when the
                     # prompt has outgrown max_context_tokens.
-                    assembled = await self.context.assemble(
-                        self.short_term,
-                        current_user_input=user_input,
-                    )
+                    assembled = await self._assemble(state.turn)
+                    overflow = self._window_exceeded(assembled.estimated_tokens, turn_num)
+                    if overflow is not None:
+                        raise overflow
 
                     # LLM call — nested under the turn span.
                     with self.trace.start_span(
@@ -465,7 +508,11 @@ class AgentLoop:
             return AgentResult(
                 final_message=f"[loop guard: {exc}]",
                 messages=self.short_term.snapshot(),
-                stop_reason=StopReason.ERROR,
+                stop_reason=(
+                    StopReason.CONTEXT_EXCEEDED
+                    if isinstance(exc, ContextWindowExceededError)
+                    else StopReason.ERROR
+                ),
                 state=state,
                 error=exc,
                 trace=self.trace,
@@ -559,7 +606,7 @@ class AgentLoop:
         policy: LoopPolicy,
         state: LoopState,
     ) -> AsyncGenerator[StreamChunk, None]:
-        self._begin_run(user_input)
+        await self._begin_run(user_input)
 
         try:
             while True:
@@ -574,10 +621,18 @@ class AgentLoop:
                 state.turn += 1
                 turn_num = self.trace.bump_turn()
 
-                assembled = await self.context.assemble(
-                    self.short_term,
-                    current_user_input=user_input,
-                )
+                assembled = await self._assemble(state.turn)
+                overflow = self._window_exceeded(assembled.estimated_tokens, turn_num)
+                if overflow is not None:
+                    yield StreamChunk(
+                        StreamChunkType.ERROR,
+                        payload={
+                            "reason": "context_exceeded",
+                            "estimated_tokens": overflow.estimated_tokens,
+                            "limit": overflow.limit,
+                        },
+                    )
+                    return
 
                 tool_calls_this_turn: list[ToolCallRequest] = []
                 text_parts: list[str] = []

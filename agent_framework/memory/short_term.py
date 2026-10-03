@@ -14,7 +14,7 @@ from __future__ import annotations
 import itertools
 import json
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from agent_framework.core.message import (
@@ -42,17 +42,23 @@ class ContextState:
         ones among them are rendered as a one-line note.
       - `reasoning_cut`: reasoning in the first N history messages is left
         out of the view.
+      - `summary`: long-term summary segments shown at the head of the view.
+        A snapshot, taken when the conversation starts (and refreshed only
+        when a trim rebuilds the prefix anyway), so the view stays stable
+        even while other sessions add to the same namespace.
     """
 
     pinned: AnyMessage | None = None
     cleared_results: int = 0
     reasoning_cut: int = 0
+    summary: list[str] = field(default_factory=list)
 
     def copy(self) -> ContextState:
         return ContextState(
             pinned=self.pinned,
             cleared_results=self.cleared_results,
             reasoning_cut=self.reasoning_cut,
+            summary=list(self.summary),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -60,6 +66,7 @@ class ContextState:
             "pinned": self.pinned.to_dict() if self.pinned is not None else None,
             "cleared_results": self.cleared_results,
             "reasoning_cut": self.reasoning_cut,
+            "summary": list(self.summary),
         }
 
     @classmethod
@@ -70,6 +77,7 @@ class ContextState:
             pinned=message_from_dict(pinned) if isinstance(pinned, dict) else None,
             cleared_results=max(0, int(data.get("cleared_results") or 0)),
             reasoning_cut=max(0, int(data.get("reasoning_cut") or 0)),
+            summary=[str(segment) for segment in data.get("summary") or []],
         )
 
 

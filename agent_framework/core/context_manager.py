@@ -4,9 +4,9 @@ The history in `ShortTermMemory` is stored in full and only grows between
 trims. Before every LLM call the context manager renders the *view* — what is
 actually sent — from that history and its `ContextState`:
 
-    [pinned first message]?  history   (old tool results in the cleared zone
-                                        become a one-line note; reasoning
-                                        before the cut is left out)
+    [summary]? [pinned first message]? history
+                     (old tool results in the cleared zone become a one-line
+                      note; reasoning before the cut is left out)
 
 and estimates the prompt: system prompt + tool definitions + messages.
 
@@ -33,9 +33,12 @@ The anchor is dropped whenever the history is trimmed or replaced. The
 calibration factor is an EWMA of actual/estimated, because chars/4 drifts
 badly on non-English text and code.
 
-Cache discipline: the system prompt is byte-stable and first; the view only
-grows between trims; dynamic per-call context (memory facts) is appended after
-the history, past the incremental cache breakpoint.
+Nothing already sent ever changes between trims — the prompt cache depends
+on it, and models that bind reasoning to the prefix reject the next request
+otherwise. So memory context is never generated per call: facts relevant to
+a run are stored in the history once, just before the user's message
+(`start_run`), and the long-term summary is a snapshot in the state, shown at
+the head of the view.
 """
 
 from __future__ import annotations
@@ -81,6 +84,9 @@ KEEP_RECENT_RESULTS = 5
 KEEP_RECENT_TURNS = 3
 # Results this small are never cleared: the note would save next to nothing.
 PROTECTED_RESULT_TOKENS = 64
+# Metadata marking a message the framework injected (not written by the user).
+CONTEXT_KEY = "context"
+
 # A trim that cannot reach the target is applied only if it leaves at least
 # this share of the limit free; a smaller gain would trigger the next trim —
 # and the next cache rebuild — almost immediately.
@@ -146,8 +152,8 @@ class _Anchor:
     """The provider-reported size of the previous call's prompt."""
 
     epoch: int
-    view_len: int  # history-view messages that call covered
-    tokens: int  # reported prompt size minus that call's dynamic preamble
+    view_len: int  # view messages that call covered
+    tokens: int  # reported prompt size
     tools_raw: int  # raw tool-definition estimate at that call
 
 
@@ -158,7 +164,6 @@ class _PendingCall:
     epoch: int
     view_len: int
     raw_total: int
-    preamble_tokens: int
     tools_raw: int
 
 
@@ -189,6 +194,7 @@ class ContextManager:
         # Epoch at which an unsatisfiable trim was last recorded.
         self._noop_epoch: int | None = None
         self._tools_raw_cache: tuple[tuple[str, ...], int] | None = None
+        self._summary_cache: tuple[tuple[str, ...], UserMessage] | None = None
 
     # ------------------------------------------------------------ properties
     @property
@@ -220,9 +226,28 @@ class ContextManager:
     # ------------------------------------------------------------- the view
     def render_view(self, history: list[AnyMessage], state: ContextState) -> list[AnyMessage]:
         """What the model sees for *history* under *state*. Pure; never mutates."""
-        view: list[AnyMessage] = [state.pinned] if state.pinned is not None else []
+        view: list[AnyMessage] = []
+        if state.summary:
+            view.append(self._summary_message(state.summary))
+        if state.pinned is not None:
+            view.append(state.pinned)
         view.extend(self._render_history(history, state))
         return view
+
+    def _summary_message(self, segments: list[str]) -> UserMessage:
+        # Cached so that every render returns the very same message.
+        key = tuple(segments)
+        if self._summary_cache is None or self._summary_cache[0] != key:
+            body = "\n\n".join(segments)
+            message = UserMessage(
+                content=(
+                    "<conversation_summary>\nSummary of earlier conversations:\n\n"
+                    f"{body}\n</conversation_summary>"
+                ),
+                metadata={CONTEXT_KEY: "summary"},
+            )
+            self._summary_cache = (key, message)
+        return self._summary_cache[1]
 
     def _render_history(
         self, history: list[AnyMessage], state: ContextState
@@ -282,26 +307,18 @@ class ContextManager:
     def _calibrated(self, raw: int) -> int:
         return int(raw * self._calibration)
 
-    def estimate(
-        self,
-        memory: ShortTermMemory,
-        view: list[AnyMessage],
-        preamble: list[AnyMessage] | None = None,
-    ) -> int:
-        """Estimated prompt size for sending *view* (+ *preamble*).
+    def estimate(self, memory: ShortTermMemory, view: list[AnyMessage]) -> int:
+        """Estimated prompt size for sending *view* rendered from *memory*.
 
         Anchored on the previous call's reported size when the history has
         only grown since; otherwise the calibrated estimate of everything.
         """
-        preamble_raw = _raw(preamble or [])
         tools_raw = self._tools_raw()
         anchor = self._anchor
         if anchor is not None and anchor.epoch == memory.epoch and anchor.view_len <= len(view):
             appended = _raw(view[anchor.view_len :])
-            return anchor.tokens + self._calibrated(
-                appended + preamble_raw + tools_raw - anchor.tools_raw
-            )
-        return self._calibrated(self._system_raw + tools_raw + _raw(view) + preamble_raw)
+            return anchor.tokens + self._calibrated(appended + tools_raw - anchor.tools_raw)
+        return self._calibrated(self._system_raw + tools_raw + _raw(view))
 
     def note_actual_tokens(self, actual_input_tokens: int) -> None:
         """Calibrate against the provider-reported size of the call just made.
@@ -321,25 +338,63 @@ class ContextManager:
         self._anchor = _Anchor(
             epoch=pending.epoch,
             view_len=pending.view_len,
-            tokens=max(0, actual_input_tokens - pending.preamble_tokens),
+            tokens=actual_input_tokens,
             tools_raw=pending.tools_raw,
         )
 
     # ------------------------------------------------------------- assembly
+    async def start_run(self, memory: ShortTermMemory, user_input: str) -> None:
+        """Store this run's memory context in the history, once.
+
+        Called at the start of a run, before the user's message is appended.
+        A new conversation (empty history) takes a snapshot of the long-term
+        summary into the state; facts relevant to *user_input* are appended as
+        one message — part of the history from then on, so every call of the
+        run sends exactly the same prefix. Facts already present in the
+        history are not repeated.
+        """
+        if self._memory is None or self._memory.long_term is None:
+            return
+        if len(memory) == 0 and memory.state.pinned is None:
+            summary = await self._memory.rolling_summary()
+            if summary:
+                state = memory.state.copy()
+                state.summary = [summary]
+                memory.state = state
+                self._record_memory_read("summary", chars=len(summary))
+        facts = await self._memory.relevant_facts(user_input)
+        seen = _injected_facts(memory.snapshot())
+        new = [f for f in facts if (f.get("key"), f.get("value")) not in seen]
+        if new:
+            memory.append(
+                UserMessage(
+                    content=_relevant_context_block(new),
+                    metadata={
+                        CONTEXT_KEY: "relevant_facts",
+                        "facts": [[f.get("key"), f.get("value")] for f in new],
+                    },
+                )
+            )
+            self._record_memory_read("relevant_facts", facts=len(new))
+
+    def _record_memory_read(self, name: str, **payload: Any) -> None:
+        if self._trace is not None:
+            self._trace.record_event(EventType.MEMORY_READ, name=name, payload=payload)
+
     async def assemble(
         self,
         memory: ShortTermMemory,
         *,
-        current_user_input: str | None = None,
         allow_trim: bool = True,
     ) -> AssembledContext:
         """Render the view for the next call, trimming *memory* first if needed.
 
         A trim mutates *memory* (pass a copy to look without touching).
+        `allow_trim=False` renders as-is even above the limit — for models that
+        bind reasoning to the prefix, in the middle of a run.
         """
-        preamble = await self._preamble(current_user_input)
         view = self.render_view(memory.snapshot(), memory.state)
-        estimated = self.estimate(memory, view, preamble)
+        estimated = self.estimate(memory, view)
 
         trim: TrimOutcome | None = None
         if allow_trim and estimated > self._limit:
@@ -352,45 +407,15 @@ class ContextManager:
         self._pending = _PendingCall(
             epoch=memory.epoch,
             view_len=len(view),
-            raw_total=self._system_raw + tools_raw + _raw(view) + _raw(preamble),
-            preamble_tokens=self._calibrated(_raw(preamble)),
+            raw_total=self._system_raw + tools_raw + _raw(view),
             tools_raw=tools_raw,
         )
         return AssembledContext(
             system_prompt=self._system_prompt,
-            messages=view + preamble,
+            messages=view,
             estimated_tokens=estimated,
             trim=trim,
         )
-
-    async def _preamble(self, current_user_input: str | None) -> list[AnyMessage]:
-        """Per-call memory context, appended after the history."""
-        preamble: list[AnyMessage] = []
-        if self._memory is None or current_user_input is None:
-            return preamble
-        facts = await self._memory.relevant_facts(current_user_input)
-        if facts:
-            preamble.append(
-                UserMessage(
-                    content=_relevant_context_block(facts),
-                    metadata={"system": "relevant_context"},
-                )
-            )
-        summary = await self._memory.rolling_summary()
-        if summary:
-            preamble.append(
-                UserMessage(
-                    content=f"<long_term_summary>\n{summary}\n</long_term_summary>",
-                    metadata={"system": "long_term_summary"},
-                )
-            )
-            if self._trace is not None:
-                self._trace.record_event(
-                    EventType.MEMORY_READ,
-                    name="rolling_summary",
-                    payload={"chars": len(summary)},
-                )
-        return preamble
 
     # ----------------------------------------------------------------- trim
     def _trim(self, memory: ShortTermMemory, estimated_before: int) -> TrimOutcome:
@@ -446,14 +471,20 @@ class ContextManager:
             pinned=state.pinned,
             cleared_results=cleared_zone,
             reasoning_cut=max(state.reasoning_cut, current_turn),
+            summary=list(state.summary),
         )
         tokens = [estimate_message_tokens(m) for m in self._render_history(history, candidate)]
         suffix = [0] * (len(tokens) + 1)
         for i in range(len(tokens) - 1, -1, -1):
             suffix[i] = suffix[i + 1] + tokens[i]
 
+        # The summary at the head of the view stays whatever is dropped.
+        head = _raw([self._summary_message(state.summary)]) if state.summary else 0
+
         def after(pinned: AnyMessage | None, drop: int) -> int:
-            kept = suffix[drop] + (estimate_message_tokens(pinned) if pinned is not None else 0)
+            kept = head + suffix[drop]
+            if pinned is not None:
+                kept += estimate_message_tokens(pinned)
             return estimated_before - self._calibrated(raw_before - kept)
 
         estimated = after(state.pinned, 0) if cleared_now else estimated_before
@@ -545,9 +576,20 @@ def _turn_starts(history: list[AnyMessage]) -> list[int]:
 def _first_user_message(messages: list[AnyMessage]) -> tuple[int, AnyMessage | None]:
     """The first message the user wrote (not context the framework injected)."""
     for index, message in enumerate(messages):
-        if _is_user_turn(message) and "context" not in message.metadata:
+        if _is_user_turn(message) and CONTEXT_KEY not in message.metadata:
             return index, message
     return len(messages), None
+
+
+def _injected_facts(history: list[AnyMessage]) -> set[tuple[Any, Any]]:
+    """(key, value) of every fact already stored in *history*."""
+    seen: set[tuple[Any, Any]] = set()
+    for message in history:
+        if message.metadata.get(CONTEXT_KEY) == "relevant_facts":
+            for pair in message.metadata.get("facts") or []:
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    seen.add((pair[0], pair[1]))
+    return seen
 
 
 def _count_below(ordinals: list[int], bound: int) -> int:

@@ -1,11 +1,9 @@
-"""ContextManager: per-call memory context placement and token calibration."""
+"""ContextManager: token calibration against the provider's reported usage."""
 
 from __future__ import annotations
 
 from agent_framework.core.context_manager import ContextManager
-from agent_framework.core.message import AssistantMessage, UserMessage
-from agent_framework.memory.backends.in_memory import InMemoryBackend
-from agent_framework.memory.long_term import LongTermMemory
+from agent_framework.core.message import UserMessage
 from agent_framework.memory.manager import MemoryManager
 from agent_framework.memory.short_term import ShortTermMemory
 
@@ -23,22 +21,6 @@ def _memory(*messages) -> ShortTermMemory:
     memory = ShortTermMemory()
     memory.extend(messages)
     return memory
-
-
-# ---------------- preamble placement ----------------
-
-async def test_preamble_is_appended_after_history():
-    backend = InMemoryBackend()
-    lt = LongTermMemory(backend=backend)
-    await lt.remember("deploy_env", "production cluster eu-1", tags=["env"])
-    mgr = _mgr(memory=MemoryManager(long_term=lt))
-
-    history = _memory(UserMessage(content="first"), AssistantMessage(content="hello"))
-    out = await mgr.assemble(history, current_user_input="deploy_env status?")
-    assert out.messages[0].content == "first"          # stable prefix first
-    last = out.messages[-1]
-    assert last.metadata.get("system") == "relevant_context"
-    assert "deploy_env" in str(last.content)
 
 
 # ---------------- calibration ----------------

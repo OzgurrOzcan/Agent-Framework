@@ -66,3 +66,16 @@ class BudgetExceededError(LoopGuardError):
         super().__init__(reason, turn=turn)
         self.spent = spent
         self.limit = limit
+
+
+class ContextWindowExceededError(LoopGuardError):
+    """Raised before a call whose prompt would not fit the context window.
+
+    The prompt is never sent, so the provider's 400 never happens; the run
+    ends with `StopReason.CONTEXT_EXCEEDED` and the history stays valid.
+    """
+
+    def __init__(self, reason: str, *, turn: int, estimated_tokens: int, limit: int) -> None:
+        super().__init__(reason, turn=turn)
+        self.estimated_tokens = estimated_tokens
+        self.limit = limit

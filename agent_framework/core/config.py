@@ -337,6 +337,14 @@ class AgentConfig:
         return self.provider_spec.context_window(self.model)
 
     @property
+    def reasoning_binds_to_prefix(self) -> bool:
+        """Whether the model rejects reasoning once earlier messages change.
+
+        Such a model is never trimmed client-side in the middle of a run.
+        """
+        return self.provider_spec.binds_reasoning_to_prefix(self.model)
+
+    @property
     def usable_context_tokens(self) -> int:
         """The most the prompt may use: the window minus the response's share."""
         return self.resolved_context_window - self.max_tokens_per_response
