@@ -231,6 +231,12 @@ class AgentConfig:
     temperature: float | None = None
     # None = resolve from the model id via the provider catalog.
     context_window: int | None = None
+    # Whether a trim must leave the reasoning of kept turns in place. Kimi-
+    # style endpoints reject a historical tool-call message without its
+    # `reasoning_content`; dropping whole turns is still fine. None = from the
+    # catalog (`kimi-` behind the OpenAI adapter); set it for an endpoint the
+    # catalog cannot infer (DeepSeek, a vLLM thinking model behind base_url).
+    keep_reasoning_in_history: bool | None = None
     # The prompt (system + tools + messages) is trimmed when it reaches this
     # size. None = min(70 % of the window, 150k, window - max_tokens_per_response).
     max_context_tokens: int | None = None
@@ -304,6 +310,12 @@ class AgentConfig:
         _require(
             self.context_window is None or self.context_window >= 1024,
             f"context_window must be >= 1024 or None, got {self.context_window}",
+        )
+        _require(
+            self.keep_reasoning_in_history is None
+            or isinstance(self.keep_reasoning_in_history, bool),
+            "keep_reasoning_in_history must be a bool or None, "
+            f"got {self.keep_reasoning_in_history!r}",
         )
         for name in ("max_context_tokens", "max_tool_result_tokens"):
             value = getattr(self, name)
@@ -393,6 +405,20 @@ class AgentConfig:
         Such a model is never trimmed client-side in the middle of a run.
         """
         return self.provider_spec.binds_reasoning_to_prefix(self.model)
+
+    @property
+    def reasoning_required_in_history(self) -> bool:
+        """Whether a kept assistant message must keep its reasoning.
+
+        A bound model (Anthropic) is the opposite case: its reasoning becomes
+        *invalid* once earlier messages change and must then go, so the
+        explicit flag never applies there.
+        """
+        if self.reasoning_binds_to_prefix:
+            return False
+        if self.keep_reasoning_in_history is not None:
+            return self.keep_reasoning_in_history
+        return self.provider_spec.requires_reasoning_in_history(self.model)
 
     @property
     def usable_context_tokens(self) -> int:
