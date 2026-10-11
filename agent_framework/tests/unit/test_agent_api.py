@@ -15,6 +15,8 @@ The surface contract:
 from __future__ import annotations
 
 
+import pytest
+
 import agent_framework
 from agent_framework.core.agent import Agent
 from agent_framework.core.message import StopReason
@@ -169,6 +171,31 @@ async def test_run_stream_full_loop():
     texts = [c.payload.get("text", "") for c in chunks
              if c.type == StreamChunkType.TEXT_DELTA]
     assert "streamed answer" in "".join(texts)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_reasoning_streamed_by_the_adapter_reaches_the_next_call(streaming):
+    """Both transports keep a `reasoning_content` block the adapter produced
+    and hand it to the next call with its text, so the next request can send
+    it back and the context estimate counts it."""
+    search, _ = counting_tool()
+    raw = {"reasoning_content": "need the tool"}
+    agent, mock = make_agent(
+        [
+            ScriptedTurn(text="", reasoning=[raw], tool_calls=[
+                {"id": "t1", "name": "search", "arguments": {"q": "ai"}}]),
+            ScriptedTurn(text="answer"),
+        ],
+        tools=[search],
+    )
+    if streaming:
+        [c async for c in agent.run_stream("find ai")]
+    else:
+        await agent.run("find ai")
+    assistant = next(m for m in mock.call_log[1]["messages"] if m.role == "assistant")
+    [block] = assistant.reasoning
+    assert block.raw == raw
+    assert block.text == "need the tool"
 
 
 async def test_run_stream_accepts_shape_parameters():

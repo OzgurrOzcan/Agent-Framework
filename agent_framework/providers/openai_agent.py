@@ -284,6 +284,7 @@ class OpenAIAdapter(BaseProviderAdapter):
 
         acc = StreamingToolAccumulator()
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         stop_reason: StopReason = StopReason.END_TURN
         usage = TokenUsage()
         # Map index → tool_call_id for proper aggregation.
@@ -299,6 +300,13 @@ class OpenAIAdapter(BaseProviderAdapter):
                     usage = _normalize_usage(u)
                 continue
             delta = choice.delta
+            # Compatible endpoints stream `reasoning_content` ahead of the
+            # answer; the same chunk type the Anthropic adapter emits, so a
+            # live UI needs no provider knowledge.
+            reasoning = getattr(delta, "reasoning_content", None)
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_parts.append(reasoning)
+                yield StreamChunk(StreamChunkType.REASONING_DELTA, payload={"text": reasoning})
             if getattr(delta, "content", None):
                 text_parts.append(delta.content)
                 yield StreamChunk(StreamChunkType.TEXT_DELTA, payload={"text": delta.content})
@@ -343,6 +351,7 @@ class OpenAIAdapter(BaseProviderAdapter):
                 "cache_read_input_tokens": usage.cache_read_input_tokens,
             },
         )
+        reasoning_block = _reasoning_block("".join(reasoning_parts))
         yield StreamChunk(
             StreamChunkType.STOP,
             payload={
@@ -351,6 +360,7 @@ class OpenAIAdapter(BaseProviderAdapter):
                 "tool_calls": [
                     {"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls
                 ],
+                "reasoning": [reasoning_block.raw] if reasoning_block else [],
             },
         )
 
