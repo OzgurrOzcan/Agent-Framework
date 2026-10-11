@@ -632,7 +632,9 @@ class Agent:
             session = self._session
             try:
                 resumed, reasoning_dropped = await session.load(
-                    self._memory.short_term, self._fingerprint()
+                    self._memory.short_term,
+                    self._fingerprint(),
+                    keep_reasoning=self.config.reasoning_required_in_history,
                 )
             except Exception as exc:
                 self._session_unreadable(exc)

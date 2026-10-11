@@ -361,6 +361,30 @@ async def test_resume_with_a_changed_prompt_drops_old_reasoning(tmp_path):
     await changed.memory.close()
 
 
+async def test_resume_with_a_changed_prompt_keeps_required_reasoning(tmp_path):
+    """A Kimi-style model's reasoning is not bound to the prompt, and a
+    restored tool-call message without it is rejected: restored as saved."""
+    db = tmp_path / "m.db"
+    config = {"system_prompt": "v1", "keep_reasoning_in_history": True}
+    first, _ = make_agent(
+        db,
+        [ScriptedTurn(text="one", reasoning=[{"reasoning_content": "why"}])],
+        config=config,
+    )
+    await first.run("q1")
+    await first.memory.close()
+
+    changed, mock = make_agent(
+        db, [ScriptedTurn(text="y")], config={**config, "system_prompt": "v2"},
+    )
+    await changed.run("q2")
+    [assistant] = [m for m in mock.call_log[0]["messages"] if isinstance(m, AssistantMessage)]
+    assert assistant.reasoning and assistant.reasoning[0].text == "why"
+    [loaded] = events(changed, EventType.MEMORY_READ, "session")
+    assert loaded.payload["reasoning_dropped"] is False
+    await changed.memory.close()
+
+
 class FactsOnly(LongTermBackend):
     """A custom backend that keeps facts but not sessions."""
 
