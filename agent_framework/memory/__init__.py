@@ -15,8 +15,10 @@ from agent_framework.memory.backends.in_memory import InMemoryBackend
 from agent_framework.memory.sessions import (
     IdleTail,
     LogEntry,
+    SessionInfo,
     SessionRecord,
     SessionStore,
+    SessionTakenOverError,
     SummarySegment,
 )
 
@@ -30,6 +32,8 @@ __all__ = [
     "SQLiteBackend",
     "InMemoryBackend",
     "SessionStore",
+    "SessionInfo",
+    "SessionTakenOverError",
     "SessionRecord",
     "LogEntry",
     "SummarySegment",

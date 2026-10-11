@@ -108,8 +108,8 @@ async def test_failed_summary_retries_at_the_next_trim(tmp_path):
     )
     fill(agent, range(8))
     await agent.run("question 8")
-    pending = agent.memory.short_term.state.pending
-    assert pending and events(agent, "summary_failed")
+    assert events(agent, "summary_failed")
+    assert agent._session.summarized_upto == 0  # the marker stayed: nothing is covered yet
     assert await segments(agent) == []
 
     fill(agent, range(9, 16))
@@ -118,7 +118,7 @@ async def test_failed_summary_retries_at_the_next_trim(tmp_path):
     [_, retry] = summary_calls(mock)
     assert "question 0" in retry["messages"][0].content  # the failed turns came along
     assert await segments(agent) == ["SUMMARY-RETRY"]
-    assert agent.memory.short_term.state.pending == []
+    assert agent._session.summarized_upto > 0
     await agent.memory.close()
 
 
@@ -330,22 +330,33 @@ async def _idle_session(store, session_id="old", last_seq=3):
 async def test_an_idle_tail_is_claimed_once(store):
     await _idle_session(store)
     later = "9999-01-01T00:00:00+00:00"  # everything counts as idle before this
-    first = await store.claim_idle_session("ns", idle_before=later, exclude_session="me")
-    second = await store.claim_idle_session("ns", idle_before=later, exclude_session="me")
+    claim = dict(idle_before=later, exclude_session="me", lease_until=later)
+    first = await store.claim_idle_session("ns", **claim)
+    second = await store.claim_idle_session("ns", **claim)
 
     assert (first.session_id, first.after_seq, first.upto_seq) == ("old", 0, 3)
     assert second is None
     # Released after a failed summary: claimable again.
     await store.release_claim("ns", first)
-    assert await store.claim_idle_session("ns", idle_before=later, exclude_session="me") is not None
+    assert await store.claim_idle_session("ns", **claim) is not None
     await store.close()
 
 
 async def test_a_session_is_not_idle_before_its_time_and_never_its_own(store):
     await _idle_session(store)
-    assert await store.claim_idle_session("ns", idle_before="2000-01-01", exclude_session="me") is None
     later = "9999-01-01T00:00:00+00:00"
-    assert await store.claim_idle_session("ns", idle_before=later, exclude_session="old") is None
+    assert (
+        await store.claim_idle_session(
+            "ns", idle_before="2000-01-01", exclude_session="me", lease_until=later
+        )
+        is None
+    )
+    assert (
+        await store.claim_idle_session(
+            "ns", idle_before=later, exclude_session="old", lease_until=later
+        )
+        is None
+    )
     await store.close()
 
 
@@ -499,7 +510,7 @@ async def test_a_claim_is_released_when_the_tail_cannot_be_read(tmp_path):
     await later.memory.close()
 
 
-@pytest.mark.parametrize("broken", ["search_facts", "summary_segments"])
+@pytest.mark.parametrize("broken", ["match_facts", "summary_segments"])
 async def test_an_unreadable_store_costs_memory_context_not_the_run(tmp_path, broken):
     agent, _ = make_agent(tmp_path / "m.db", [ScriptedTurn(text="ok")])
     backend = agent.memory.long_term.backend

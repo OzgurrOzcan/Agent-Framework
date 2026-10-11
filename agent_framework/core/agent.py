@@ -40,6 +40,7 @@ import hashlib
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, Iterable
+from datetime import timedelta
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -59,6 +60,7 @@ from agent_framework.memory.manager import MemoryManager
 from agent_framework.memory.sessions import (
     ConversationSession,
     SessionStore,
+    SessionTakenOverError,
     tool_set_fingerprint,
 )
 from agent_framework.memory.short_term import ContextState
@@ -276,7 +278,9 @@ class Agent:
         self._system_prompt = self._build_system_prompt()
         # Saved conversation, when the long-term store keeps sessions. Loaded
         # once before the first run, saved after every run.
-        self._session = _build_session(self.config.memory, self._memory, self.session_id)
+        self._session = _build_session(
+            self.config.memory, self._memory, self.session_id, owner=f"{self.agent_id}/{uuid.uuid4().hex}"
+        )
         self._session_ready = self._session is None
         self._session_lock = asyncio.Lock()
         # With a log to write, messages leaving the history unlogged are held.
@@ -292,11 +296,18 @@ class Agent:
                 auto=self.config.memory.summarize if self.config.memory else False,
                 # The summary heads every new conversation; no trim removes it.
                 budget_tokens=self.config.resolved_max_context_tokens // 5,
+                idle_after=timedelta(minutes=self.config.memory.idle_after_minutes),
+                idle_per_start=self.config.memory.idle_summaries_per_start,
+                retention=(
+                    timedelta(days=self.config.memory.retention_days)
+                    if self.config.memory.retention_days is not None
+                    else None
+                ),
             )
-            if self._session is not None
+            if self._session is not None and self.config.memory is not None
             else None
         )
-        self._memory.set_summarize(self._summarize_now)
+        self._memory.set_summarize(self._summarize_now, self._summarize_idle_now)
         self._context_manager = ContextManager(
             system_prompt=self._system_prompt,
             max_context_tokens=self.config.resolved_max_context_tokens,
@@ -413,6 +424,9 @@ class Agent:
 
         `result.context` reports what the last call was sent: message counts,
         the token estimate, cleared results and the provider's cache hits.
+
+        Raises `SessionTakenOverError` (before any model call) once another
+        agent has opened this agent's session; see `memory.sessions`.
         """
         await self._ensure_mcp()
         policy = self._run_policy(
@@ -510,6 +524,7 @@ class Agent:
         same session_id later starts from nothing rather than the old history.
         """
         await self._ensure_mcp()  # the saved fingerprint covers the MCP tools
+        self._check_ownership()
         async with self._session_lock:
             if not self._session_ready and self._session is not None:
                 # Never loaded: continue its log numbering, but not its history.
@@ -573,12 +588,29 @@ class Agent:
         when there is nothing new). False without long-term summaries."""
         if self._summarizer is None:
             return False
+        if self._loop._running:
+            raise RuntimeError(
+                "memory.summarize() was called while a run is in progress; it saves "
+                "and summarizes the conversation, so call it between runs."
+            )
         await self._ensure_mcp()  # the session fingerprint covers the MCP tools
         await self._ensure_session()
         if self._session is None:  # it could not be read: nothing to summarize safely
             return False
         await self._flush_session()
         return await self._summarizer.summarize_session()
+
+    async def _summarize_idle_now(self, limit: int) -> int:
+        """`await agent.memory.summarize_idle(limit)`: work through the
+        namespace's idle, unsummarized conversations (not this one)."""
+        if self._summarizer is None:
+            return 0
+        return await self._summarizer.summarize_idle(limit)
+
+    def _check_ownership(self) -> None:
+        """Refuse to go on with a session another agent has taken over."""
+        if self._session is not None and self._session.taken_over:
+            raise SessionTakenOverError(self._session._taken_over_message())
 
     def _fingerprint(self) -> str:
         return tool_set_fingerprint(self._system_prompt, self._tools)
@@ -590,6 +622,7 @@ class Agent:
         empty history — but nothing is saved for this agent afterwards, so
         the conversation in the store is never overwritten by a fresh one.
         """
+        self._check_ownership()
         if self._session_ready:
             return
         async with self._session_lock:
@@ -640,6 +673,17 @@ class Agent:
             return
         try:
             logged = await self._session.flush(self._memory.short_term, self._fingerprint())
+        except SessionTakenOverError as exc:
+            # Another agent owns the session now. Recorded here; the next
+            # run(), complete(), run_stream() or summarize() raises it.
+            self._trace.record_event(
+                EventType.ERROR,
+                name="session_taken_over",
+                status=SpanStatus.ERROR,
+                payload={"session_id": self.session_id},
+                error=ErrorInfo.from_exception(exc),
+            )
+            return
         except Exception as exc:
             self._trace.record_event(
                 EventType.ERROR,
@@ -899,7 +943,7 @@ def _summary_model(config: AgentConfig) -> str:
 
 
 def _build_session(
-    memory: MemoryConfig | None, manager: MemoryManager, session_id: str
+    memory: MemoryConfig | None, manager: MemoryManager, session_id: str, *, owner: str
 ) -> ConversationSession | None:
     """The saved conversation, if the long-term store keeps sessions."""
     if memory is None or manager.long_term is None:
@@ -913,7 +957,9 @@ def _build_session(
             stacklevel=3,
         )
         return None
-    return ConversationSession(backend, namespace=manager.long_term.namespace, session_id=session_id)
+    return ConversationSession(
+        backend, namespace=manager.long_term.namespace, session_id=session_id, owner=owner
+    )
 
 
 def _build_provider(config: AgentConfig) -> BaseProviderAdapter:

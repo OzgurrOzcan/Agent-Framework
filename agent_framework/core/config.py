@@ -127,6 +127,17 @@ class MemoryConfig:
     # Long-term: a cheaper model of the same provider for those summaries.
     # None = the agent's own model.
     summary_model: str | None = None
+    # Long-term: a conversation with no activity for this long is finished
+    # enough for its unsummarized part to be summarized by the next new
+    # conversation of the namespace (or by `memory.summarize_idle()`).
+    idle_after_minutes: int = 30
+    # Long-term: how many such idle conversations a new conversation
+    # summarizes before its first call (one LLM call each). 0 = none inline;
+    # run `memory.summarize_idle()` from a background job instead.
+    idle_summaries_per_start: int = 2
+    # Long-term: delete sessions idle for this many days whose whole log is
+    # in the summary, so the store does not grow forever. None = keep all.
+    retention_days: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.store, PurePath):
@@ -148,17 +159,40 @@ class MemoryConfig:
             or (isinstance(self.summary_model, str) and self.summary_model.strip() != ""),
             f"MemoryConfig.summary_model must be a model id or None, got {self.summary_model!r}",
         )
+        _require(
+            _is_int(self.idle_after_minutes) and self.idle_after_minutes >= 1,
+            f"MemoryConfig.idle_after_minutes must be an int >= 1, got {self.idle_after_minutes!r}",
+        )
+        _require(
+            _is_int(self.idle_summaries_per_start) and self.idle_summaries_per_start >= 0,
+            "MemoryConfig.idle_summaries_per_start must be an int >= 0, got "
+            f"{self.idle_summaries_per_start!r}",
+        )
+        _require(
+            self.retention_days is None
+            or (_is_int(self.retention_days) and self.retention_days >= 1),
+            f"MemoryConfig.retention_days must be an int >= 1 or None, got {self.retention_days!r}",
+        )
 
     def long_term_settings(self) -> list[str]:
         """The long-term-only fields that were changed from their defaults."""
-        changed = []
-        if self.namespace != "default":
-            changed.append("namespace")
-        if self.summarize is not True:
-            changed.append("summarize")
-        if self.summary_model is not None:
-            changed.append("summary_model")
-        return changed
+        defaults = MemoryConfig()
+        return [
+            name
+            for name in (
+                "namespace",
+                "summarize",
+                "summary_model",
+                "idle_after_minutes",
+                "idle_summaries_per_start",
+                "retention_days",
+            )
+            if getattr(self, name) != getattr(defaults, name)
+        ]
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 @dataclass(frozen=True)

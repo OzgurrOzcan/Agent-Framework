@@ -515,18 +515,26 @@ class ContextManager:
             self._memory_read_failed("relevant_facts", exc)
             return
         seen = _injected_facts(memory.snapshot())
-        new = [f for f in facts if (f.get("key"), f.get("value")) not in seen]
+        # A fact already in the history is not repeated; one whose value
+        # changed since is stored again, saying what it replaces — the old
+        # line stays in the history (nothing sent is ever edited), so the
+        # model must be told which one holds.
+        new = [f for f in facts if f.get("key") not in seen or seen[f.get("key")] != f.get("value")]
         if new:
             memory.append(
                 UserMessage(
-                    content=_relevant_context_block(new),
+                    content=_relevant_context_block(new, seen),
                     metadata={
                         CONTEXT_KEY: "relevant_facts",
                         "facts": [[f.get("key"), f.get("value")] for f in new],
                     },
                 )
             )
-            self._record_memory_read("relevant_facts", facts=len(new))
+            self._record_memory_read(
+                "relevant_facts",
+                facts=len(new),
+                updated=sum(1 for f in new if f.get("key") in seen),
+            )
 
     def _memory_read_failed(self, name: str, exc: BaseException) -> None:
         if self._trace is not None:
@@ -946,14 +954,14 @@ def _first_user_message(messages: list[AnyMessage]) -> tuple[int, AnyMessage | N
     return len(messages), None
 
 
-def _injected_facts(history: list[AnyMessage]) -> set[tuple[Any, Any]]:
-    """(key, value) of every fact already stored in *history*."""
-    seen: set[tuple[Any, Any]] = set()
+def _injected_facts(history: list[AnyMessage]) -> dict[Any, Any]:
+    """key → the value most recently stored in *history* for each fact."""
+    seen: dict[Any, Any] = {}
     for message in history:
         if message.metadata.get(CONTEXT_KEY) == "relevant_facts":
             for pair in message.metadata.get("facts") or []:
                 if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                    seen.add((pair[0], pair[1]))
+                    seen[pair[0]] = pair[1]
     return seen
 
 
@@ -961,6 +969,13 @@ def _count_below(ordinals: list[int], bound: int) -> int:
     return bisect.bisect_left(ordinals, bound)
 
 
-def _relevant_context_block(facts: list[dict[str, Any]]) -> str:
-    body = "\n".join(f"- {f.get('key', '')}: {f.get('value', '')}" for f in facts)
+def _relevant_context_block(facts: list[dict[str, Any]], seen: dict[Any, Any]) -> str:
+    lines = []
+    for f in facts:
+        key, value = f.get("key", ""), f.get("value", "")
+        line = f"- {key}: {value}"
+        if key in seen:
+            line += f" (updated; replaces: {seen[key]})"
+        lines.append(line)
+    body = "\n".join(lines)
     return f"<relevant_context>\n{body}\n</relevant_context>"

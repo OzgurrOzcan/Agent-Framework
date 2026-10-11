@@ -12,6 +12,17 @@ Each message is stamped with its sequence number (`metadata["log_seq"]`) the
 first time it is logged, so it is never logged twice and a trim can tell
 which of the turns it drops were already summarized.
 
+A session has one live agent at a time. Loading it takes an *owner* token
+(a fencing token: the newest loader wins), and every save is accepted only
+from the current owner — a second agent that opened the same session, on
+another server say, makes the first one's next save fail loudly with
+`SessionTakenOverError` instead of the two silently overwriting each other.
+
+Summarizing another session's idle tail is done under a *lease*: the claim
+holds a token for a few minutes and the summary is written only if the token
+still holds, in the same transaction that advances the session's
+`summarized_upto`. A claim whose holder crashed simply expires.
+
 `SessionStore` is the persistence interface; `SQLiteBackend` and
 `InMemoryBackend` implement it. `ConversationSession` is the agent's side:
 load once before the first run, flush after every run.
@@ -45,8 +56,35 @@ class SessionRecord:
     fingerprint: str = ""
     # Log entries up to this sequence number are in the long-term summary.
     summarized_upto: int = 0
+    # The token of the agent that currently owns the session ('' = none).
+    owner: str = ""
     created_at: str = ""
     updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class SessionInfo:
+    """What a listing says about one session, without its history."""
+
+    session_id: str
+    created_at: str
+    updated_at: str
+    last_seq: int
+    summarized_upto: int
+
+    @property
+    def summarized(self) -> bool:
+        """Whether the long-term summary covers the whole log."""
+        return self.summarized_upto >= self.last_seq
+
+
+class SessionTakenOverError(RuntimeError):
+    """Another agent opened this session; this one must not save over it.
+
+    Raised by `run()`, `complete()`, `run_stream()`, `clear_history()` and
+    `memory.summarize()` once a save was refused. Build a new agent with the
+    same `session_id` to continue from what the store holds now.
+    """
 
 
 @dataclass(frozen=True)
@@ -68,8 +106,9 @@ class IdleTail:
     """A claimed, not yet summarized stretch of another session's log."""
 
     session_id: str
-    after_seq: int  # summarized_upto before the claim
-    upto_seq: int  # the session's last_seq, which the claim advanced it to
+    after_seq: int  # summarized_upto at the claim
+    upto_seq: int  # the session's last_seq at the claim
+    token: str = ""  # the lease; the summary is written only while it holds
 
 
 class SessionStore(abc.ABC):
@@ -80,20 +119,55 @@ class SessionStore(abc.ABC):
         """The saved session, or None if this namespace has no such session."""
 
     @abc.abstractmethod
+    async def take_session(self, namespace: str, session_id: str, owner: str) -> None:
+        """Make *owner* the session's current owner (no-op if it is not saved yet).
+
+        The newest taker wins; the previous owner's next save then fails."""
+
+    @abc.abstractmethod
     async def save_session(
         self,
         namespace: str,
         session_id: str,
         record: SessionRecord,
         new_log: list[LogEntry],
+        *,
+        owner: str = "",
     ) -> None:
-        """Append *new_log* and replace the saved state — atomically."""
+        """Append *new_log* and replace the saved state — atomically.
+
+        With *owner*, the save is accepted only if the stored session has no
+        owner yet or the same one; otherwise `SessionTakenOverError` is raised
+        and nothing is written. An empty *owner* skips the check.
+        """
 
     @abc.abstractmethod
     async def session_log(
         self, namespace: str, session_id: str, *, after_seq: int = 0
     ) -> list[LogEntry]:
         """The session's log entries with a sequence number above *after_seq*."""
+
+    # ---- housekeeping ----
+    @abc.abstractmethod
+    async def list_sessions(
+        self, namespace: str, *, idle_before: str | None = None, limit: int = 100
+    ) -> list[SessionInfo]:
+        """The namespace's sessions, most recently updated first; with
+        *idle_before*, only those not updated since that ISO timestamp."""
+
+    @abc.abstractmethod
+    async def delete_session(self, namespace: str, session_id: str) -> bool:
+        """Remove the session's state and log. False if there was none."""
+
+    @abc.abstractmethod
+    async def prune_sessions(
+        self, namespace: str, *, idle_before: str, summarized_only: bool = True
+    ) -> int:
+        """Delete the sessions not updated since *idle_before*; returns how many.
+
+        With *summarized_only*, a session whose log runs past its summary is
+        kept: deleting it would lose what no summary holds yet.
+        """
 
     # ---- the namespace's long-term summary ----
     @abc.abstractmethod
@@ -108,6 +182,7 @@ class SessionStore(abc.ABC):
         *,
         session_id: str | None = None,
         expected_upto: int | None = None,
+        claim_token: str | None = None,
         summarized_upto: int = 0,
     ) -> bool:
         """Append a segment and, in the same transaction, advance *session_id*'s
@@ -115,8 +190,13 @@ class SessionStore(abc.ABC):
         leave a summary whose messages still look unsummarized.
 
         With *expected_upto*, nothing is written (False) if the session's
-        stored marker is no longer that value: another session summarized
-        part of this one meanwhile, and appending would cover it twice.
+        stored marker is no longer that value, or if another session holds an
+        unexpired claim on it: another writer is covering part of this one,
+        and appending would cover it twice.
+
+        With *claim_token* (an idle tail claimed by `claim_idle_session`),
+        nothing is written unless that claim still holds and the marker is
+        still at *expected_upto*; the claim is released with the write.
         """
 
     @abc.abstractmethod
@@ -131,18 +211,31 @@ class SessionStore(abc.ABC):
 
     @abc.abstractmethod
     async def claim_idle_session(
-        self, namespace: str, *, idle_before: str, exclude_session: str
+        self,
+        namespace: str,
+        *,
+        idle_before: str,
+        exclude_session: str,
+        lease_until: str,
     ) -> IdleTail | None:
-        """Claim the newest session idle since *idle_before* whose log runs
-        past its `summarized_upto`, by advancing that marker to its last_seq.
+        """Lease the *oldest* session idle since *idle_before* whose log runs
+        past its `summarized_upto` and that nobody holds an unexpired claim on.
 
-        Atomic: of two callers, at most one gets the claim, so the same tail
-        is never summarized twice.
+        The lease lasts until *lease_until* (ISO timestamp) and advances no
+        marker: the marker moves only when the summary is written (see
+        `append_summary` with the tail's token). Atomic: of two callers at
+        most one gets a given tail; a claim whose holder died expires and the
+        tail is claimed again.
         """
 
     @abc.abstractmethod
     async def release_claim(self, namespace: str, tail: IdleTail) -> None:
-        """Undo a claim whose summary failed (only if nobody advanced it since)."""
+        """End a claim early, after a failed summary (only if it still holds)."""
+
+    @abc.abstractmethod
+    async def idle_backlog(self, namespace: str, *, idle_before: str, exclude_session: str) -> int:
+        """How many sessions idle since *idle_before* still have unsummarized
+        messages — the queue `claim_idle_session` works through."""
 
 
 def encode(value: Any) -> str:
@@ -199,10 +292,15 @@ async def run_to_end(write: Awaitable[T]) -> tuple[T, bool]:
 class ConversationSession:
     """One agent's conversation in a `SessionStore`."""
 
-    def __init__(self, store: SessionStore, *, namespace: str, session_id: str) -> None:
+    def __init__(
+        self, store: SessionStore, *, namespace: str, session_id: str, owner: str = ""
+    ) -> None:
         self.store = store
         self.namespace = namespace
         self.session_id = session_id
+        # This agent's fencing token: loading takes it, every save presents
+        # it. '' (direct use in tests) skips ownership altogether.
+        self.owner = owner
         self._next_seq = 1
         self._summarized_upto = 0
         self._created_at = ""
@@ -213,6 +311,9 @@ class ConversationSession:
         # Set when the stored session could not be read: this agent's numbers
         # and marker are then meaningless, so nothing may be written for it.
         self.broken = False
+        # Set when a save was refused because another agent took the session
+        # over: nothing of this one may be written for it from then on.
+        self.taken_over = False
 
     @property
     def summarized_upto(self) -> int:
@@ -228,6 +329,10 @@ class ConversationSession:
         record = await self.store.load_session(self.namespace, self.session_id)
         if record is not None:
             self.mark_summarized(record.summarized_upto)
+
+    def pending_entries(self) -> list[LogEntry]:
+        """Entries numbered but not yet saved (a trim numbered them)."""
+        return list(self._pending_log)
 
     def assign_seqs(self, messages: Iterable[AnyMessage]) -> None:
         """Give *messages* their log numbers now (in order) instead of at flush.
@@ -254,6 +359,8 @@ class ConversationSession:
         record = await self.store.load_session(self.namespace, self.session_id)
         if record is None:
             return False, False
+        if self.owner:
+            await self.store.take_session(self.namespace, self.session_id, self.owner)
         history = [message_from_dict(raw) for raw in record.history]
         state = ContextState.from_dict(record.state)
         changed = bool(record.fingerprint) and record.fingerprint != fingerprint
@@ -270,6 +377,8 @@ class ConversationSession:
         (for a conversation cleared before it was ever loaded)."""
         record = await self.store.load_session(self.namespace, self.session_id)
         if record is not None:
+            if self.owner:
+                await self.store.take_session(self.namespace, self.session_id, self.owner)
             self._adopt(record)
 
     def _adopt(self, record: SessionRecord) -> None:
@@ -287,6 +396,8 @@ class ConversationSession:
         """
         if self.broken:
             raise RuntimeError("the stored session could not be read; not saving over it")
+        if self.taken_over:
+            raise SessionTakenOverError(self._taken_over_message())
         async with self._flush_lock:
             seq = self._next_seq
             stamped: list[AnyMessage] = []
@@ -308,8 +419,17 @@ class ConversationSession:
                     created_at=self._created_at,
                 )
                 _, cancelled = await run_to_end(
-                    self.store.save_session(self.namespace, self.session_id, record, new_log)
+                    self.store.save_session(
+                        self.namespace, self.session_id, record, new_log, owner=self.owner
+                    )
                 )
+            except SessionTakenOverError:
+                # Refused for good: the numbers go back, and no later flush
+                # may try again — the store now belongs to the other agent.
+                self.taken_over = True
+                for message in stamped:
+                    message.metadata.pop(LOG_SEQ_KEY, None)
+                raise
             except BaseException:
                 for message in stamped:
                     message.metadata.pop(LOG_SEQ_KEY, None)
@@ -320,6 +440,14 @@ class ConversationSession:
             if cancelled:
                 raise asyncio.CancelledError()
             return len(new_log)
+
+    def _taken_over_message(self) -> str:
+        return (
+            f"session {self.session_id!r} of namespace {self.namespace!r} was opened by "
+            "another agent, which now owns it; this agent no longer saves to it. Build "
+            "a new agent with the same session_id to continue from the stored "
+            "conversation (one live agent per session)."
+        )
 
 
 def log_seq(message: AnyMessage) -> int | None:

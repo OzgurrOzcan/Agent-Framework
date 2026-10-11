@@ -179,6 +179,9 @@ def test_memory_config_has_no_turn_limit():
         (MemoryConfig(namespace="customer-42"), "namespace"),
         (MemoryConfig(summarize=False), "summarize"),
         (MemoryConfig(summary_model="claude-haiku-4-5"), "summary_model"),
+        (MemoryConfig(idle_after_minutes=5), "idle_after_minutes"),
+        (MemoryConfig(idle_summaries_per_start=0), "idle_summaries_per_start"),
+        (MemoryConfig(retention_days=30), "retention_days"),
     ],
 )
 def test_long_term_fields_require_a_store(memory, field):

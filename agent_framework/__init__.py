@@ -46,6 +46,7 @@ from agent_framework.interrupts.renderers.callback import CallbackRenderer
 from agent_framework.interrupts.renderers.headless import HeadlessRenderer
 from agent_framework.interrupts.models import InterruptEvent, InterruptResponse
 from agent_framework.memory.manager import MemoryManager
+from agent_framework.memory.sessions import SessionInfo, SessionTakenOverError
 from agent_framework.memory.short_term import ShortTermMemory
 from agent_framework.memory.long_term import LongTermMemory
 from agent_framework.memory.backends.sqlite import SQLiteBackend
@@ -91,6 +92,8 @@ __all__ = [
     "InterruptEvent",
     "InterruptResponse",
     "MemoryManager",
+    "SessionInfo",
+    "SessionTakenOverError",
     "ShortTermMemory",
     "LongTermMemory",
     "SQLiteBackend",
