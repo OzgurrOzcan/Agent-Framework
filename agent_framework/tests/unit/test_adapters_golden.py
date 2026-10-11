@@ -279,6 +279,119 @@ def test_openai_denormalize_golden():
     ]
 
 
+# ---------------- reasoning_content round-trip (Kimi, DeepSeek, vLLM) ----------------
+
+def _openai_reasoning_history(reasoning_content="think first"):
+    return [
+        UserMessage(content="find it"),
+        AssistantMessage(
+            content=None,
+            tool_calls=[ToolCallRequest(id="c1", name="search", arguments={"q": "x"})],
+            reasoning=[ReasoningContent(
+                provider="openai",
+                raw={"reasoning_content": reasoning_content},
+                text=reasoning_content,
+            )],
+        ),
+        ToolResultMessage(content=[
+            ToolResult(tool_use_id="c1", name="search", content="result!", is_error=False),
+        ]),
+    ]
+
+
+def test_openai_denormalize_sends_reasoning_content_back():
+    """A compatible endpoint that exposed its reasoning gets it back verbatim —
+    Kimi rejects a historical tool-call message without it."""
+    adapter = OpenAIAdapter(api_key="k", client=FakeOpenAIClient())
+    wire = adapter.denormalize_messages(_openai_reasoning_history())
+    assert wire[1] == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "search", "arguments": json.dumps({"q": "x"})}},
+        ],
+        "reasoning_content": "think first",
+    }
+
+
+def test_openai_denormalize_omits_reasoning_content_when_absent():
+    """Without a block the key is not on the wire at all — a request to
+    OpenAI itself must not change by a byte."""
+    adapter = OpenAIAdapter(api_key="k", client=FakeOpenAIClient())
+    history = _openai_reasoning_history()
+    history[1] = AssistantMessage(content=None, tool_calls=history[1].tool_calls)
+    wire = adapter.denormalize_messages(history)
+    assert "reasoning_content" not in wire[1]
+
+
+def test_openai_denormalize_ignores_foreign_reasoning():
+    """An Anthropic thinking block has no `reasoning_content` meaning here;
+    the OpenAI golden above already pins that it is dropped, this pins it
+    stays dropped when the two kinds are mixed."""
+    adapter = OpenAIAdapter(api_key="k", client=FakeOpenAIClient())
+    history = _openai_reasoning_history()
+    history[1] = AssistantMessage(
+        content=None,
+        tool_calls=history[1].tool_calls,
+        reasoning=[
+            ReasoningContent(provider="anthropic",
+                             raw={"type": "thinking", "thinking": "hmm", "signature": "s"}),
+            *history[1].reasoning,
+        ],
+    )
+    wire = adapter.denormalize_messages(history)
+    assert wire[1]["reasoning_content"] == "think first"
+
+
+async def test_openai_normalize_captures_reasoning_content(oai):
+    adapter, client = oai
+    raw = _openai_raw(text="done")
+    raw.choices[0].message.reasoning_content = "let me think"
+    client._api._response = raw
+    resp = await adapter.call(system="", messages=[UserMessage(content="x")], tools=[],
+                              model="m", max_tokens=10)
+    [block] = resp.assistant_message.reasoning
+    assert block.provider == "openai"
+    assert block.raw == {"reasoning_content": "let me think"}
+    assert block.text == "let me think"
+    assert resp.assistant_message.content == "done"
+
+
+@pytest.mark.parametrize("value", [None, ""])
+async def test_openai_normalize_without_reasoning_content(oai, value):
+    """OpenAI's own replies carry no such field (the fake has none); an empty
+    string from a non-thinking call is not a block either."""
+    adapter, client = oai
+    raw = _openai_raw(text="done")
+    if value is not None:
+        raw.choices[0].message.reasoning_content = value
+    client._api._response = raw
+    resp = await adapter.call(system="", messages=[UserMessage(content="x")], tools=[],
+                              model="m", max_tokens=10)
+    assert resp.assistant_message.reasoning == []
+
+
+async def test_openai_reasoning_content_survives_a_full_round_trip(oai):
+    """Reply → AssistantMessage → next request: what came in goes back out."""
+    adapter, client = oai
+    raw = _openai_raw(text=None, finish_reason="tool_calls")
+    raw.choices[0].message.reasoning_content = "need the tool"
+    raw.choices[0].message.tool_calls = [SimpleNamespace(
+        id="c1", function=SimpleNamespace(name="search", arguments=json.dumps({"q": "x"})),
+    )]
+    client._api._response = raw
+    resp = await adapter.call(system="", messages=[UserMessage(content="x")], tools=[_TOOL],
+                              model="m", max_tokens=10)
+    history = [UserMessage(content="x"), resp.assistant_message, ToolResultMessage(content=[
+        ToolResult(tool_use_id="c1", name="search", content="r", is_error=False),
+    ])]
+    await adapter.call(system="", messages=history, tools=[_TOOL], model="m", max_tokens=10)
+    sent = client._api.last_request["messages"]
+    assert sent[1]["reasoning_content"] == "need the tool"
+    assert sent[1]["tool_calls"][0]["id"] == "c1"
+
+
 # ---------------- tool_choice matrix ----------------
 
 @pytest.mark.parametrize("tc,expected", [
