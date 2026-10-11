@@ -200,6 +200,75 @@ async def test_trim_drops_whole_old_turns_when_needed():
     assert memory.state.pinned.content == "question 0"
 
 
+def _reasoned_turn(i: int, answer_chars: int = 2_000):
+    """A turn whose assistant called a tool with `reasoning_content` ahead of it."""
+    block = ReasoningContent.from_raw("openai", {"reasoning_content": f"why {i}"})
+    call = ToolCallRequest(id=f"c{i}", name="search", arguments={"q": str(i)})
+    return [
+        UserMessage(content=f"question {i}"),
+        AssistantMessage(content="", tool_calls=[call], reasoning=[block]),
+        ToolResultMessage(content=[
+            ToolResult(tool_use_id=f"c{i}", name="search", content="r" * 300, is_error=False)
+        ]),
+        AssistantMessage(content="a" * answer_chars, reasoning=[block]),
+    ]
+
+
+@pytest.mark.parametrize("keeps", [False, True])
+async def test_trim_keeps_old_reasoning_only_when_the_model_requires_it(keeps):
+    """Kimi rejects a kept tool-call message without its reasoning_content:
+    a trim still clears results and drops whole turns, but step 3 is off."""
+    trace = ExecutionTrace()
+    memory = _memory()
+    for i in range(8):
+        memory.extend(_reasoned_turn(i))
+    out = await _mgr(limit=3_000, trace=trace, keeps_reasoning=keeps).assemble(memory)
+
+    assert out.trim.applied and out.trim.dropped_turns > 0 and out.trim.cleared_results > 0
+    assert out.trim.reasoning_cut is (not keeps)
+    kept = [m for m in out.messages if isinstance(m, AssistantMessage)]
+    current = memory.snapshot()[_turn_starts(memory.snapshot())[-1]:]
+    old = kept[: len(kept) - sum(isinstance(m, AssistantMessage) for m in current)]
+    assert old, "the trim must leave some earlier turns to test"
+    if keeps:
+        assert all(m.reasoning for m in kept)
+        assert out.reasoning_dropped == 0
+    else:
+        assert not any(m.reasoning for m in old)
+        assert out.reasoning_dropped == len(old)
+    # Either way the current turn's reasoning is sent.
+    assert all(m.reasoning for m in kept[len(old):])
+
+
+@pytest.mark.parametrize("model,kept", [("openai:kimi-k3", True), ("openai:gpt-5", False)])
+async def test_the_config_decides_whether_a_trim_keeps_reasoning(model, kept):
+    """End to end: the catalog names Kimi, the config resolves it, the agent
+    hands it to the manager, and the trimmed request still carries every
+    kept message's reasoning_content."""
+    mock = MockLLMProvider([ScriptedTurn(text="ok")])
+    agent = Agent(
+        AgentConfig(model=model, api_key="k", base_url="https://example.invalid/v1",
+                    context_window=131_072, max_context_tokens=3_000),
+        provider=mock, memory=MemoryConfig(),
+    )
+    for i in range(8):
+        agent.memory.short_term.extend(_reasoned_turn(i))
+    before = len(agent.get_history())
+    result = await agent.run("question 8")
+    assert len(agent.get_history()) < before  # the trim fired
+    sent = [m for m in mock.call_log[0]["messages"] if isinstance(m, AssistantMessage)]
+    assert sent
+    assert all(bool(m.reasoning) for m in sent) is kept
+    assert (result.context.reasoning_dropped == 0) is kept
+
+
+def test_a_bound_model_never_keeps_old_reasoning():
+    """Both flags at once is a contradiction the config already resolves;
+    the manager resolves it the same way if constructed directly."""
+    mgr = _mgr(binds_reasoning=True, keeps_reasoning=True)
+    assert mgr._binds_reasoning and not mgr._keeps_reasoning
+
+
 async def test_one_trim_reaches_60_percent():
     trace = ExecutionTrace()
     mgr = _mgr(limit=3_000, trace=trace)
