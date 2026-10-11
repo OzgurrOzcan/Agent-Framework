@@ -59,13 +59,31 @@ class ReasoningContent:
     """Opaque reasoning/thinking block — preserved verbatim and round-tripped.
 
     Anthropic rejects tool-use turns where the prior `thinking` block has been
-    stripped, so we keep the raw provider payload here and re-attach it on the
-    next request.
+    stripped, and Kimi-style endpoints reject a historical tool-call message
+    without its `reasoning_content`, so we keep the raw provider payload here
+    and the adapter re-attaches it on the next request.
     """
 
     provider: Literal["openai", "anthropic"]
     raw: dict[str, Any]
     text: str | None = None
+
+    # Where each adapter keeps the readable text in its raw block.
+    _TEXT_KEYS = ("thinking", "reasoning_content", "text")
+
+    @classmethod
+    def from_raw(cls, provider: str, raw: dict[str, Any]) -> ReasoningContent:
+        """A block from an adapter's raw payload, with `text` filled in.
+
+        Keeps the loop ignorant of provider field names: `text` is what the
+        token estimate counts, so a block whose text key is unknown here would
+        be budgeted as free.
+        """
+        text = next(
+            (v for k in cls._TEXT_KEYS if isinstance((v := raw.get(k)), str) and v),
+            None,
+        )
+        return cls(provider=provider, raw=raw, text=text)  # type: ignore[arg-type]
 
 
 @dataclass

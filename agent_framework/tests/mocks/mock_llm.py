@@ -119,10 +119,7 @@ class MockLLMProvider(BaseProviderAdapter):
         msg = AssistantMessage(
             content=turn.text,
             tool_calls=tool_calls,
-            reasoning=[
-                ReasoningContent(provider="anthropic", raw=r, text=r.get("thinking"))
-                for r in turn.reasoning
-            ],
+            reasoning=[ReasoningContent.from_raw("anthropic", r) for r in turn.reasoning],
             stop_reason=stop_reason,
             usage=turn.usage,
         )

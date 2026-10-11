@@ -56,6 +56,21 @@ def test_assistant_message_full_roundtrip():
     assert r.usage == m.usage
 
 
+@pytest.mark.parametrize("provider,raw,text", [
+    ("anthropic", {"type": "thinking", "thinking": "hm", "signature": "s"}, "hm"),
+    ("openai", {"reasoning_content": "need the tool"}, "need the tool"),
+    ("mock", {"text": "plain"}, "plain"),
+    ("anthropic", {"type": "redacted_thinking", "data": "opaque"}, None),
+])
+def test_reasoning_from_raw_finds_the_text(provider, raw, text):
+    """`text` is what the token estimate counts, so each adapter's text key
+    must be known here — a block with an unknown key would be budgeted free."""
+    block = ReasoningContent.from_raw(provider, raw)
+    assert block.provider == provider
+    assert block.raw is raw
+    assert block.text == text
+
+
 def test_tool_result_message_roundtrip():
     m = ToolResultMessage(content=[
         ToolResult(tool_use_id="c1", name="search", content="found",

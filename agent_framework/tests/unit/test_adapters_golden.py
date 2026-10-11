@@ -392,6 +392,64 @@ async def test_openai_reasoning_content_survives_a_full_round_trip(oai):
     assert sent[1]["tool_calls"][0]["id"] == "c1"
 
 
+class _FakeOpenAIStream:
+    """`chat.completions.create(stream=True)`: an async iterator of chunks."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+def _openai_chunk(content=None, reasoning_content=None, finish_reason=None, usage=None):
+    delta = SimpleNamespace(content=content, tool_calls=None)
+    if reasoning_content is not None:
+        delta.reasoning_content = reasoning_content
+    return SimpleNamespace(
+        choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)]
+        if usage is None else [],
+        usage=usage,
+    )
+
+
+async def test_openai_stream_captures_reasoning_content(oai):
+    """Reasoning deltas arrive ahead of the answer: emitted live as
+    REASONING_DELTA, and the whole of it is in the STOP payload's `reasoning`
+    so the loop stores a block the next request sends back."""
+    adapter, client = oai
+    chunks = [
+        _openai_chunk(reasoning_content="let me "),
+        _openai_chunk(reasoning_content="think"),
+        _openai_chunk(content="done", finish_reason="stop"),
+        _openai_chunk(usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2,
+                                            prompt_tokens_details=None)),
+    ]
+    client._api._response = _FakeOpenAIStream(chunks)
+    out = [c async for c in adapter.stream(
+        system="", messages=[UserMessage(content="x")], tools=[], model="m", max_tokens=10,
+    )]
+    reasoning = [c.payload["text"] for c in out if c.type is StreamChunkType.REASONING_DELTA]
+    assert reasoning == ["let me ", "think"]
+    stop = next(c for c in out if c.type is StreamChunkType.STOP)
+    assert stop.payload["text"] == "done"
+    assert stop.payload["reasoning"] == [{"reasoning_content": "let me think"}]
+
+
+async def test_openai_stream_without_reasoning_content(oai):
+    adapter, client = oai
+    client._api._response = _FakeOpenAIStream([_openai_chunk(content="hi", finish_reason="stop")])
+    out = [c async for c in adapter.stream(
+        system="", messages=[UserMessage(content="x")], tools=[], model="m", max_tokens=10,
+    )]
+    assert not [c for c in out if c.type is StreamChunkType.REASONING_DELTA]
+    assert next(c for c in out if c.type is StreamChunkType.STOP).payload["reasoning"] == []
+
+
 # ---------------- tool_choice matrix ----------------
 
 @pytest.mark.parametrize("tc,expected", [

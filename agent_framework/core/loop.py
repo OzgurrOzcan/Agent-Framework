@@ -868,16 +868,13 @@ class AgentLoop:
                                     except ValueError:
                                         stop_reason = StopReason.END_TURN
                                     # Preserve reasoning/thinking blocks for round-trip:
-                                    # Anthropic rejects the next tool-use turn if the
-                                    # prior thinking block was stripped.
+                                    # the adapter re-attaches them on the next call
+                                    # (Anthropic and Kimi reject a tool-call turn
+                                    # whose reasoning was stripped).
                                     for r in chunk.payload.get("reasoning") or []:
                                         if isinstance(r, dict):
                                             reasoning_blocks.append(
-                                                ReasoningContent(
-                                                    provider=self.provider.name,  # type: ignore[arg-type]
-                                                    raw=r,
-                                                    text=r.get("thinking") or r.get("text"),
-                                                )
+                                                ReasoningContent.from_raw(self.provider.name, r)
                                             )
                     except asyncio.CancelledError:
                         raise
