@@ -243,13 +243,17 @@ class ConversationSession:
             self._pending_log.append(LogEntry(seq=self._next_seq, message=message.to_dict()))
             self._next_seq += 1
 
-    async def load(self, memory: ShortTermMemory, fingerprint: str) -> tuple[bool, bool]:
+    async def load(
+        self, memory: ShortTermMemory, fingerprint: str, *, keep_reasoning: bool = False
+    ) -> tuple[bool, bool]:
         """Restore *memory* from the store: ``(resumed, reasoning_dropped)``.
 
         Reasoning is bound to the system prompt and tool set it was produced
         with; if either changed since the session was saved, the restored
         history's reasoning is left out of the view (a leading run of blocks,
-        so dropping it is always valid).
+        so dropping it is always valid). Not with *keep_reasoning*: such a
+        model (Kimi) does not bind reasoning to the prompt but rejects a
+        tool-call message without it, so the history is restored as saved.
         """
         record = await self.store.load_session(self.namespace, self.session_id)
         if record is None:
@@ -258,7 +262,11 @@ class ConversationSession:
         state = ContextState.from_dict(record.state)
         changed = bool(record.fingerprint) and record.fingerprint != fingerprint
         dropped = False
-        if changed and any(getattr(m, "reasoning", None) for m in history):
+        if (
+            changed
+            and not keep_reasoning
+            and any(getattr(m, "reasoning", None) for m in history)
+        ):
             state.reasoning_cut = len(history)
             dropped = True
         memory.replace_all(history, state=state)
