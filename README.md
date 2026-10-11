@@ -390,6 +390,31 @@ provider's native structured-output mode, which self-hosted runtimes support to 
 degrees — `request_extra` does not apply to it, so on a runtime without that support use
 `complete()` and parse the text yourself.
 
+**Hosted endpoints that expose their reasoning.** Kimi, DeepSeek and a vLLM-served
+thinking model speak the same wire format but return the model's reasoning as
+`reasoning_content` — and expect it back on every earlier assistant message: Kimi rejects
+a tool-call message without it. The adapter keeps the field as an opaque block and sends
+it back verbatim, so the tool loop, memory and a context trim all work; a trim still
+clears old results and drops whole turns, but leaves the reasoning of the turns it keeps
+in place. Kimi is recognized from its model name; for an endpoint the name cannot reveal,
+say so with `keep_reasoning_in_history=True`.
+
+```python
+agent = Agent(AgentConfig(
+    model="openai:kimi-k3",
+    base_url="https://api.moonshot.ai/v1",
+    api_key="<your Moonshot key>",      # explicit: OPENAI_API_KEY would be the wrong key
+    context_window=1_000_000,
+    # Non-OpenAI request fields go inside extra_body: the SDK rejects unknown
+    # keyword arguments. Kimi K2.6's thinking switch, for instance:
+    # request_extra={"extra_body": {"thinking": {"type": "disabled"}}},
+))
+```
+
+Two Kimi-specific notes: leave `temperature` unset (each Kimi model accepts one fixed
+value and rejects any other), and `tool_choice="any"` — sent as `required` — is accepted
+by K3 only.
+
 ### Observability
 
 Tracing is not an add-on — the loop, executor, permission resolver, and context manager
@@ -558,7 +583,8 @@ trim takes it down to 60 % of the limit, with no LLM call:
 2. If that is not enough, whole old turns go. The conversation's first user message is
    pinned, and the newest three turns always stay.
 3. Reasoning from before the current turn is left out, since it was produced against the
-   old prefix.
+   old prefix — except on a model that requires it (Kimi), where steps 1 and 2 do all
+   the trimming.
 
 On models that bind reasoning to the conversation prefix — Claude Fable 5.1, Opus 5.5,
 Sonnet 5.5, and any Claude model the catalog does not know yet — editing what was already
