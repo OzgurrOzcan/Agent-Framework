@@ -715,6 +715,7 @@ class Agent:
             ),
             native_tool_result_clearing=self._native_clearing,
             reasoning_binds_to_prefix=self.config.reasoning_binds_to_prefix,
+            reasoning_required_in_history=self.config.reasoning_required_in_history,
             summary_model=self._summary_model if self._summarizer is not None else None,
             context_filter=(
                 getattr(self._context_filter, "__qualname__", type(self._context_filter).__name__)
