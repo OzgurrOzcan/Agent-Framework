@@ -317,6 +317,7 @@ class Agent:
             trace=self._trace,
             context_filter=context_filter,
             binds_reasoning=self.config.reasoning_binds_to_prefix,
+            keeps_reasoning=self.config.reasoning_required_in_history,
             model=self.config.model,
             summarizer=self._summarizer,
             usable_tokens=self.config.usable_context_tokens,
