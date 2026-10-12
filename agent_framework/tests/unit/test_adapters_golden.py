@@ -18,7 +18,13 @@ from agent_framework.core.message import (
     UserMessage,
 )
 from agent_framework.providers.anthropic_agent import AnthropicAdapter, _to_stop_reason as anth_stop
-from agent_framework.providers.base import ToolChoice
+from agent_framework.providers.base import (
+    AppliedEdit,
+    ContextEditsRejectedError,
+    StreamChunkType,
+    ToolChoice,
+    ToolResultClearing,
+)
 from agent_framework.providers.openai_agent import OpenAIAdapter, _to_stop_reason as oai_stop
 from agent_framework.tools.models import ToolMetadata
 
@@ -474,3 +480,216 @@ def test_sdk_client_receives_retry_and_extra_kwargs(monkeypatch):
     assert captured["timeout"] == 33.0
     assert captured["max_retries"] == 5
     assert captured["default_headers"] == {"x": "1"}
+
+
+# ---------------- server-side tool-result clearing (context editing) ----------------
+
+_CLEARING = ToolResultClearing(
+    trigger_tokens=150_000,
+    keep_results=5,
+    clear_at_least_tokens=15_000,
+    exclude_tools=("ask_user", "read_spec"),
+)
+
+
+def _anthropic_raw_with_edits(cleared_uses=3, cleared_tokens=42_000):
+    raw = _anthropic_raw()
+    raw.context_management = SimpleNamespace(
+        applied_edits=[
+            SimpleNamespace(
+                type="clear_tool_uses_20250919",
+                cleared_tool_uses=cleared_uses,
+                cleared_input_tokens=cleared_tokens,
+            )
+        ]
+    )
+    return raw
+
+
+class _FakeAnthropicStream:
+    """`client.messages.stream(...)`: an async context manager of events."""
+
+    def __init__(self, events, final):
+        self._events, self._final = events, final
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for event in self._events:
+            yield event
+
+    async def get_final_message(self):
+        return self._final
+
+
+class _FakeStreamingAPI(_FakeMessagesAPI):
+    def __init__(self, response, events):
+        super().__init__(response)
+        self._events = events
+
+    def stream(self, **kwargs):
+        self.last_request = kwargs
+        return _FakeAnthropicStream(self._events, self._response)
+
+
+class FakeBetaAnthropicClient:
+    """Both the regular and the beta Messages API, recorded separately."""
+
+    def __init__(self, response=None, events=()):
+        response = response or _anthropic_raw()
+        self.messages = _FakeStreamingAPI(response, list(events))
+        self.beta = SimpleNamespace(messages=_FakeStreamingAPI(response, list(events)))
+
+
+async def test_golden_request_with_tool_result_clearing():
+    client = FakeBetaAnthropicClient()
+    adapter = AnthropicAdapter(api_key="test-key", client=client)
+    await adapter.call(
+        system="sys", messages=[UserMessage(content="hi")], tools=[_TOOL],
+        model="claude-opus-5-5", max_tokens=128, context_edits=_CLEARING,
+    )
+    req = client.beta.messages.last_request
+    assert req["betas"] == ["context-management-2025-06-27"]
+    assert req["context_management"] == {
+        "edits": [
+            {
+                "type": "clear_tool_uses_20250919",
+                "trigger": {"type": "input_tokens", "value": 150_000},
+                "keep": {"type": "tool_uses", "value": 5},
+                "clear_at_least": {"type": "input_tokens", "value": 15_000},
+                "exclude_tools": ["ask_user", "read_spec"],
+            }
+        ]
+    }
+    # Everything else is the regular request, unchanged.
+    plain = FakeBetaAnthropicClient()
+    await AnthropicAdapter(api_key="k", client=plain).call(
+        system="sys", messages=[UserMessage(content="hi")], tools=[_TOOL],
+        model="claude-opus-5-5", max_tokens=128,
+    )
+    expected = dict(plain.messages.last_request)
+    assert {k: v for k, v in req.items() if k not in ("betas", "context_management")} == expected
+
+
+async def test_beta_client_only_when_clearing_is_requested():
+    client = FakeBetaAnthropicClient()
+    adapter = AnthropicAdapter(api_key="test-key", client=client)
+    await adapter.call(
+        system="", messages=[UserMessage(content="hi")], tools=[],
+        model="claude-opus-5-5", max_tokens=64,
+    )
+    assert client.messages.last_request is not None
+    assert client.beta.messages.last_request is None
+    assert "betas" not in client.messages.last_request
+
+    await adapter.call(
+        system="", messages=[UserMessage(content="hi")], tools=[],
+        model="claude-opus-5-5", max_tokens=64, context_edits=_CLEARING,
+    )
+    assert client.beta.messages.last_request is not None
+
+
+async def test_caller_betas_are_kept_alongside_context_management():
+    client = FakeBetaAnthropicClient()
+    await AnthropicAdapter(api_key="k", client=client).call(
+        system="", messages=[UserMessage(content="hi")], tools=[],
+        model="claude-opus-5-5", max_tokens=64, context_edits=_CLEARING,
+        extra={"betas": ["fast-mode-2026-02-01"]},
+    )
+    assert client.beta.messages.last_request["betas"] == [
+        "fast-mode-2026-02-01",
+        "context-management-2025-06-27",
+    ]
+
+
+async def test_applied_edits_are_normalized():
+    raw = _anthropic_raw_with_edits()
+    expected = [AppliedEdit("clear_tool_uses_20250919", 3, 42_000)]
+
+    client = FakeBetaAnthropicClient(response=raw)
+    adapter = AnthropicAdapter(api_key="k", client=client)
+    response = await adapter.call(
+        system="", messages=[UserMessage(content="hi")], tools=[],
+        model="claude-opus-5-5", max_tokens=64, context_edits=_CLEARING,
+    )
+    assert response.applied_edits == expected
+
+    events = [
+        SimpleNamespace(
+            type="content_block_start", index=0, content_block=SimpleNamespace(type="text")
+        ),
+        SimpleNamespace(
+            type="content_block_delta", index=0,
+            delta=SimpleNamespace(type="text_delta", text="ok"),
+        ),
+        SimpleNamespace(type="content_block_stop", index=0),
+        SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=raw.usage,
+            context_management=raw.context_management,
+        ),
+    ]
+    client = FakeBetaAnthropicClient(response=raw, events=events)
+    adapter = AnthropicAdapter(api_key="k", client=client)
+    chunks = [
+        c
+        async for c in adapter.stream(
+            system="", messages=[UserMessage(content="hi")], tools=[],
+            model="claude-opus-5-5", max_tokens=64, context_edits=_CLEARING,
+        )
+    ]
+    usage = next(c for c in chunks if c.type is StreamChunkType.USAGE)
+    stop = next(c for c in chunks if c.type is StreamChunkType.STOP)
+    assert [AppliedEdit.from_dict(e) for e in usage.payload["applied_edits"]] == expected
+    assert stop.payload["applied_edits"] == usage.payload["applied_edits"]
+
+
+class _BadRequest(Exception):
+    status_code = 400
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_a_rejection_of_the_edits_is_normalized(streaming):
+    client = FakeBetaAnthropicClient()
+
+    def reject(**kwargs):
+        raise _BadRequest("Error code: 400 - context_management: Extra inputs are not permitted")
+
+    async def reject_async(**kwargs):
+        reject()
+
+    client.beta.messages.create = reject_async
+    client.beta.messages.stream = reject
+    adapter = AnthropicAdapter(api_key="k", client=client)
+    request = {
+        "system": "", "messages": [UserMessage(content="hi")], "tools": [],
+        "model": "claude-opus-5-5", "max_tokens": 64, "context_edits": _CLEARING,
+    }
+    with pytest.raises(ContextEditsRejectedError):
+        if streaming:
+            async for _ in adapter.stream(**request):
+                pass
+        else:
+            await adapter.call(**request)
+
+
+async def test_an_unrelated_400_is_not_mistaken_for_a_rejection():
+    client = FakeBetaAnthropicClient()
+
+    async def fail(**kwargs):
+        raise _BadRequest("Error code: 400 - max_tokens: must be positive")
+
+    client.beta.messages.create = fail
+    with pytest.raises(_BadRequest):
+        await AnthropicAdapter(api_key="k", client=client).call(
+            system="", messages=[UserMessage(content="hi")], tools=[],
+            model="claude-opus-5-5", max_tokens=64, context_edits=_CLEARING,
+        )

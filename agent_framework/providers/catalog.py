@@ -6,6 +6,7 @@ This table is the single source of truth for everything provider-shaped:
   - which environment variable holds that provider's API key
   - which model-name prefixes belong to the provider
   - that provider's context windows
+  - which of its models bind reasoning to the conversation prefix
 
 Adding a provider is therefore one `ProviderSpec` plus one
 `BaseProviderAdapter` subclass — nothing else in the framework changes.
@@ -70,6 +71,14 @@ class ProviderSpec:
     # (model-name prefix, context window) pairs; longest prefix wins.
     context_windows: tuple[tuple[str, int], ...] = ()
     default_context_window: int = DEFAULT_CONTEXT_WINDOW
+    # Whether a model's reasoning blocks are only valid while every message
+    # before them is unchanged (the provider rejects them otherwise). On such
+    # a model the framework never edits the history in the middle of a run.
+    # Exact model names win over (prefix, binds) pairs; longest prefix wins;
+    # `reasoning_binding_default` covers models in neither.
+    reasoning_binding_exact: tuple[tuple[str, bool], ...] = ()
+    reasoning_binding_prefixes: tuple[tuple[str, bool], ...] = ()
+    reasoning_binding_default: bool = False
 
     def prefix_score(self, model: str) -> int:
         """Length of the longest owned prefix matching *model*; 0 if none.
@@ -101,6 +110,18 @@ class ProviderSpec:
         """Best-effort context window for *model* (longest prefix wins)."""
         known = self.known_context_window(model)
         return known if known is not None else self.default_context_window
+
+    def binds_reasoning_to_prefix(self, model: str) -> bool:
+        """True if *model*'s reasoning is invalidated by editing earlier messages."""
+        for name, binds in self.reasoning_binding_exact:
+            if model == name:
+                return binds
+        best_len = -1
+        result = self.reasoning_binding_default
+        for prefix, binds in self.reasoning_binding_prefixes:
+            if model.startswith(prefix) and len(prefix) > best_len:
+                best_len, result = len(prefix), binds
+        return result
 
 
 # --------------------------------------------------------------------------
@@ -158,6 +179,31 @@ ANTHROPIC = ProviderSpec(
         # Current-generation Claude models (Opus/Sonnet 4.6+, 5.x).
         ("claude-", 1_000_000),
     ),
+    # "Preserved thinking": on these models a thinking block's signature
+    # covers the system prompt, the tool set and every message before it, so
+    # editing the history mid-run turns the next request into a 400. Claude
+    # Mythos 5.1 does not run that check. A model this table does not know is
+    # assumed to bind — the safe side: it only gives up client-side trims in
+    # the middle of a run, while assuming the opposite would end runs in 400s.
+    reasoning_binding_exact=(
+        ("claude-fable-5-1", True),
+        ("claude-opus-5-5", True),
+        ("claude-sonnet-5-5", True),
+        ("claude-mythos-5-1", False),
+        ("claude-fable-5", False),
+        ("claude-mythos-5", False),
+        ("claude-opus-5", False),
+        ("claude-sonnet-5", False),
+    ),
+    reasoning_binding_prefixes=(
+        ("claude-2", False),
+        ("claude-3", False),
+        ("claude-instant", False),
+        ("claude-haiku-4", False),
+        ("claude-sonnet-4", False),
+        ("claude-opus-4", False),
+    ),
+    reasoning_binding_default=True,
 )
 
 OPENAI = ProviderSpec(
@@ -175,6 +221,8 @@ OPENAI = ProviderSpec(
         ("o3", 200_000),
         ("o4-", 200_000),
     ),
+    # Chat Completions never sends reasoning back, so there is none to bind.
+    reasoning_binding_default=False,
 )
 
 

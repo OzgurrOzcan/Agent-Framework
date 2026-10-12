@@ -11,10 +11,14 @@ Key invariants:
   - Prompt caching: one breakpoint on the system prompt and one incremental
     breakpoint on the last stable conversation message (preamble messages —
     those with `metadata["system"]` set — stay after the breakpoint).
+  - Server-side tool-result clearing (context editing) goes through
+    `client.beta.messages.*` with the context-management beta — only when
+    `context_edits` is passed; every other request uses the regular API.
 """
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, AsyncIterator
 
 from agent_framework.core.message import (
@@ -30,18 +34,25 @@ from agent_framework.core.message import (
     UserMessage,
 )
 from agent_framework.providers.base import (
+    AppliedEdit,
     BaseProviderAdapter,
+    ContextEditsRejectedError,
     NormalizedResponse,
     StreamChunk,
     StreamChunkType,
     ToolChoice,
+    ToolResultClearing,
 )
 from agent_framework.providers.streaming import StreamingToolAccumulator
 from agent_framework.tools.models import ToolMetadata
 
+CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27"
+CLEAR_TOOL_USES_EDIT = "clear_tool_uses_20250919"
+
 
 class AnthropicAdapter(BaseProviderAdapter):
     name = "anthropic"
+    supports_tool_result_clearing = True
 
     def __init__(
         self,
@@ -144,6 +155,7 @@ class AnthropicAdapter(BaseProviderAdapter):
         tool_choice: ToolChoice | None,
         enable_caching: bool,
         extra: dict[str, Any] | None,
+        context_edits: ToolResultClearing | None = None,
     ) -> dict[str, Any]:
         wire, origins = self._denormalize_with_origins(messages)
         if enable_caching:
@@ -164,7 +176,17 @@ class AnthropicAdapter(BaseProviderAdapter):
             req["tool_choice"] = _tool_choice_param(tool_choice)
         if extra:
             req.update(extra)
+        if context_edits is not None:
+            req["context_management"] = {"edits": [_clear_tool_uses_edit(context_edits)]}
+            betas = list(req.get("betas") or [])
+            if CONTEXT_MANAGEMENT_BETA not in betas:
+                betas.append(CONTEXT_MANAGEMENT_BETA)
+            req["betas"] = betas
         return req
+
+    def _messages_api(self, context_edits: ToolResultClearing | None) -> Any:
+        """The beta API for context editing; the regular one otherwise."""
+        return self._client.beta.messages if context_edits is not None else self._client.messages
 
     # ---------- non-streaming call ----------
     async def call(
@@ -179,13 +201,20 @@ class AnthropicAdapter(BaseProviderAdapter):
         tool_choice: ToolChoice | None = None,
         enable_caching: bool = True,
         extra: dict[str, Any] | None = None,
+        context_edits: ToolResultClearing | None = None,
     ) -> NormalizedResponse:
         req = self._build_request(
             system=system, messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
             tool_choice=tool_choice, enable_caching=enable_caching, extra=extra,
+            context_edits=context_edits,
         )
-        raw = await self._client.messages.create(**req)
+        try:
+            raw = await self._messages_api(context_edits).create(**req)
+        except Exception as exc:
+            if context_edits is not None and _rejects_context_edits(exc):
+                raise ContextEditsRejectedError(str(exc)) from exc
+            raise
         return self._normalize(raw)
 
     # ---------- structured output (native) ----------
@@ -228,11 +257,13 @@ class AnthropicAdapter(BaseProviderAdapter):
         tool_choice: ToolChoice | None = None,
         enable_caching: bool = True,
         extra: dict[str, Any] | None = None,
+        context_edits: ToolResultClearing | None = None,
     ) -> AsyncIterator[StreamChunk]:
         req = self._build_request(
             system=system, messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
             tool_choice=tool_choice, enable_caching=enable_caching, extra=extra,
+            context_edits=context_edits,
         )
 
         acc = StreamingToolAccumulator()
@@ -240,8 +271,19 @@ class AnthropicAdapter(BaseProviderAdapter):
         reasoning_blocks: list[ReasoningContent] = []
         stop_reason: StopReason = StopReason.END_TURN
         usage = TokenUsage()
+        applied_edits: list[AppliedEdit] = []
 
-        async with self._client.messages.stream(**req) as stream:
+        async with contextlib.AsyncExitStack() as stack:
+            # The request is sent when the stream is entered, so a rejection
+            # of the edits surfaces here — before any chunk was produced.
+            try:
+                stream = await stack.enter_async_context(
+                    self._messages_api(context_edits).stream(**req)
+                )
+            except Exception as exc:
+                if context_edits is not None and _rejects_context_edits(exc):
+                    raise ContextEditsRejectedError(str(exc)) from exc
+                raise
             current_block_index: dict[int, str] = {}  # idx → "tool_use:<id>" / "text" / "thinking"
             current_tool_ids: dict[int, str] = {}
             async for event in stream:
@@ -295,6 +337,9 @@ class AnthropicAdapter(BaseProviderAdapter):
                     sr = getattr(event.delta, "stop_reason", None)
                     if sr:
                         stop_reason = _to_stop_reason(sr)
+                    edits = _applied_edits(event)
+                    if edits:
+                        applied_edits = edits
                     u = getattr(event, "usage", None)
                     if u is not None:
                         usage = TokenUsage(
@@ -329,10 +374,12 @@ class AnthropicAdapter(BaseProviderAdapter):
                 sr = getattr(final_msg, "stop_reason", None)
                 if sr:
                     stop_reason = _to_stop_reason(sr)
+                applied_edits = _applied_edits(final_msg) or applied_edits
             except Exception:
                 pass
 
         tool_calls = acc.all_complete()
+        edits_payload = [e.to_dict() for e in applied_edits]
         yield StreamChunk(
             StreamChunkType.USAGE,
             payload={
@@ -340,6 +387,7 @@ class AnthropicAdapter(BaseProviderAdapter):
                 "output_tokens": usage.output_tokens,
                 "cache_read_input_tokens": usage.cache_read_input_tokens,
                 "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "applied_edits": edits_payload,
             },
         )
         yield StreamChunk(
@@ -351,6 +399,7 @@ class AnthropicAdapter(BaseProviderAdapter):
                     {"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls
                 ],
                 "reasoning": [r.raw for r in reasoning_blocks],
+                "applied_edits": edits_payload,
             },
         )
 
@@ -394,7 +443,61 @@ class AnthropicAdapter(BaseProviderAdapter):
             stop_reason=stop,
             usage=usage,
         )
-        return NormalizedResponse(assistant_message=msg, stop_reason=stop, usage=usage, raw=raw)
+        return NormalizedResponse(
+            assistant_message=msg,
+            stop_reason=stop,
+            usage=usage,
+            raw=raw,
+            applied_edits=_applied_edits(raw),
+        )
+
+
+def _clear_tool_uses_edit(clearing: ToolResultClearing) -> dict[str, Any]:
+    edit: dict[str, Any] = {
+        "type": CLEAR_TOOL_USES_EDIT,
+        "trigger": {"type": "input_tokens", "value": clearing.trigger_tokens},
+        "keep": {"type": "tool_uses", "value": clearing.keep_results},
+        "clear_at_least": {"type": "input_tokens", "value": clearing.clear_at_least_tokens},
+    }
+    if clearing.exclude_tools:
+        edit["exclude_tools"] = list(clearing.exclude_tools)
+    return edit
+
+
+def _rejects_context_edits(exc: BaseException) -> bool:
+    """A 400 that names context editing: the edits, not the request, are refused.
+
+    A gateway that does not forward the beta, an account without access, or a
+    model without the feature all answer this way; any other 400 is a real
+    error and propagates.
+    """
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("context_management", "context-management", "clear_tool_uses")
+    )
+
+
+def _field(obj: Any, name: str) -> Any:
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def _applied_edits(obj: Any) -> list[AppliedEdit]:
+    """`context_management.applied_edits` of a message or delta, normalized."""
+    management = _field(obj, "context_management")
+    edits = _field(management, "applied_edits") if management is not None else None
+    out: list[AppliedEdit] = []
+    for edit in edits or []:
+        out.append(
+            AppliedEdit(
+                type=str(_field(edit, "type") or ""),
+                cleared_tool_uses=int(_field(edit, "cleared_tool_uses") or 0),
+                cleared_input_tokens=int(_field(edit, "cleared_input_tokens") or 0),
+            )
+        )
+    return out
 
 
 def _system_blocks(system: str, *, cache: bool = True) -> list[dict[str, Any]]:

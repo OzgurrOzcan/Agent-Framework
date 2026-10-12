@@ -1,13 +1,29 @@
-"""Two-tier memory: short-term (working buffer) + long-term (persistent)."""
+"""Memory: short-term (the conversation) and long-term (facts, sessions, summaries).
 
-from agent_framework.memory.short_term import ShortTermMemory
+Agents are stateless unless `MemoryConfig` turns memory on; see
+`agent_framework.core.config.MemoryConfig`. A custom long-term backend
+implements `LongTermBackend` (facts) and, to keep conversations and their
+summaries, `SessionStore`.
+"""
+
+from agent_framework.memory.short_term import ContextState, ShortTermMemory
 from agent_framework.memory.long_term import LongTermMemory, Fact
 from agent_framework.memory.manager import MemoryManager
 from agent_framework.memory.backends.base import LongTermBackend
 from agent_framework.memory.backends.sqlite import SQLiteBackend
 from agent_framework.memory.backends.in_memory import InMemoryBackend
+from agent_framework.memory.sessions import (
+    IdleTail,
+    LogEntry,
+    SessionInfo,
+    SessionRecord,
+    SessionStore,
+    SessionTakenOverError,
+    SummarySegment,
+)
 
 __all__ = [
+    "ContextState",
     "ShortTermMemory",
     "LongTermMemory",
     "Fact",
@@ -15,4 +31,11 @@ __all__ = [
     "LongTermBackend",
     "SQLiteBackend",
     "InMemoryBackend",
+    "SessionStore",
+    "SessionInfo",
+    "SessionTakenOverError",
+    "SessionRecord",
+    "LogEntry",
+    "SummarySegment",
+    "IdleTail",
 ]

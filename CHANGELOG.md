@@ -6,7 +6,77 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed — BREAKING
+### Changed — BREAKING: context and memory
+
+An agent is now **stateless by default** — every `run()`, `run_stream()` and
+`complete()` starts from an empty history — and memory is one setting:
+
+```diff
+-agent = Agent("claude-opus-5")              # remembered every earlier run
++agent = Agent("claude-opus-5")              # every run starts fresh
++chat = Agent("claude-opus-5", memory=MemoryConfig())          # the conversation, in RAM
++desk = Agent(
++    "claude-opus-5",
++    memory=MemoryConfig(store="support.db", namespace="customer-42"),
++    session_id="ticket-4412",                # long-term: saved and resumable
++)
+```
+
+| Removed or changed | Replacement |
+|---|---|
+| History kept across runs by default | `memory=MemoryConfig()`; without it each run starts fresh |
+| `CompactionConfig`, `AgentConfig.compaction` | `AgentConfig.max_context_tokens` and `max_tool_result_tokens`, both automatic by default |
+| `AgentConfig.response_buffer_tokens` | removed: the prompt may use `context_window - max_tokens_per_response` |
+| `AgentConfig.compaction_buffer_tokens` | removed: trimming makes no LLM call, so it needs no headroom |
+| `ShortTermMemory(max_messages=, max_tokens=)` | removed (it trimmed silently on every append); the token limit decides |
+| `Agent(memory=MemoryManager(...))` | `Agent(memory=MemoryConfig(...), memory_backend=<LongTermBackend>)` |
+| `agent.clear_history()` | `await agent.clear_history()` (it saves the emptied conversation) |
+| `LLM_CALL` payload `ctx_tokens`, `compaction` | `estimated_tokens`, `trimmed` and the rest of the context report |
+| `ContextManager(context_window=, response_buffer_tokens=, compaction=, summarizer=...)`, `assemble(history, current_user_input=)`, `AssembledContext.persist` | `ContextManager(max_context_tokens=, max_tool_result_tokens=, ...)`, `assemble(short_term, call=)` |
+| Memory facts and the rolling summary appended at the end of every call | facts stored once per run before the user's message; the summary at the head of the view |
+| Tool results unbounded until compaction cut them to 500 tokens | capped when produced, at `max_tool_result_tokens` (head and tail kept) |
+
+`AgentConfig.from_dict()` rejects a removed field with its replacement in the
+message, so a stale config file fails at load time.
+
+Why: the old pipeline truncated, windowed and re-summarized on every call. Each
+of those rewrote content the provider had already seen, which invalidated the
+prompt cache on every call — and, on models that bind reasoning to the
+conversation prefix, turned the next request into a 400. Memory facts were
+regenerated at the end of every prompt for the same reason. And remembering by
+default meant every unrelated `run()` carried, and paid for, the ones before it.
+
+Other behaviour changes:
+
+- **Trimming is deterministic and rare.** Nothing already sent changes between
+  trims. When the prompt (system + tool definitions + messages) exceeds
+  `max_context_tokens`, one trim — no LLM call — brings it to 60 % of the
+  limit: old tool results become a one-line note (the newest five stay, as do
+  errors, small results, `ask_user` and tools with `clear_old_results=False`),
+  then whole old turns go, the first user message pinned and the newest three
+  turns kept. Reasoning before the current turn is left out after a trim.
+- **Reasoning stays valid on prefix-bound models.** On Claude Fable 5.1, Opus
+  5.5 and Sonnet 5.5 (and, to be safe, any Claude model the catalog does not
+  know yet) the history is trimmed only at the start of a run; the catalog
+  records this per model.
+- **A prompt that cannot fit is never sent.** The run ends with
+  `StopReason.CONTEXT_EXCEEDED` before the request, and the history stays
+  valid; with memory, the next run's first call trims it.
+- **Anthropic clears old tool results server-side in long runs**
+  (`clear_tool_uses_20250919`, requested automatically against the vendor API,
+  off for a custom `base_url`, switched off for the session after a rejection).
+- **Tool calls without results are answered.** A remembered conversation in
+  which `complete()` returned tool calls unexecuted no longer fails on the next
+  run: they get a "not executed" result first.
+- **A remembered run that fails before any reply leaves no trace.** If the
+  prompt would not fit or the provider rejects it, the run's input is taken
+  back out of the history (`input_rolled_back` on the run span), so one
+  oversized message cannot make every later run fail. A run the caller stops
+  keeps its input.
+- `Agent(session_id=...)` defaults to a fresh id per agent, never the trace's,
+  and is what permission prompts and `ask_user` report.
+
+### Changed — BREAKING: agent construction
 
 Agent construction is one call, and the model id is the only required input.
 There is no compatibility shim: the project is pre-1.0 and unpublished, so
@@ -83,6 +153,35 @@ Other behaviour changes:
 
 ### Added
 
+- **`MemoryConfig`** (`store`, `namespace`, `summarize`, `summary_model`) and
+  `AgentConfig.memory`, also a flat `Agent(memory=...)` override. Long-term
+  fields without a store or backend are rejected rather than ignored.
+- **Long-term memory with no database code.** `MemoryConfig(store="app.db")`
+  builds SQLite-backed memory (one connection, WAL, `":memory:"` works) that
+  `await agent.memory.close()` closes; `Agent(memory_backend=...)` takes any
+  `LongTermBackend` instead.
+- **Sessions.** With a store, every run saves the conversation — a full log of
+  every message plus the current history and context state — and an agent with
+  the same `session_id` resumes it; `Agent.connect()` loads it eagerly. A custom
+  backend keeps sessions by implementing `SessionStore`.
+- **Long-term summaries.** Turns a trim removes are summarized into the
+  namespace's summary (one call each, segments merged over 8,000 tokens); a new
+  conversation starts with it; an idle session's unsummarized tail is
+  summarized once (claimed atomically); `await agent.memory.summarize()` does it
+  on demand. Calls are cost-tracked and traced.
+- **`context_filter=fn`** on `Agent(...)`: your function shapes what is sent
+  before every call, never what is stored; its output is repaired into a valid
+  conversation, and on prefix-bound models an edit of what was already sent
+  mid-run is rejected and traced.
+- **`run(dry_run=True)`** shows what the next call would send (trimmed if it
+  would be) without calling the model or changing anything, and
+  **`AgentResult.context`** (`ContextReport`) reports what the last call sent:
+  message counts, the token estimate, cleared results, dropped reasoning, cache
+  hits. Every `llm_call` span records the same.
+- `@tool(max_result_tokens=..., clear_old_results=...)`,
+  `ToolExecutor(default_max_result_tokens=...)`, `StopReason.DRY_RUN`,
+  `ProviderSpec.binds_reasoning_to_prefix`, and the provider-neutral
+  `ToolResultClearing` / `context_edits=` adapter parameter.
 - **Provider catalog** (`agent_framework.providers.catalog`). One
   `ProviderSpec` per provider is the single source of truth for the adapter
   factory, the API-key environment variable, the model-name prefixes the
@@ -98,10 +197,10 @@ Other behaviour changes:
   message — never a silent default, and never inferred from which API keys
   happen to be set. Prefixes are broad, so a newly released model works without
   a framework release.
-- **Seven flat overrides on `Agent(...)`** — `system_prompt`, `max_turns`,
-  `max_budget_usd`, `temperature`, `api_key`, `base_url`, `context_window` —
-  which override a passed `AgentConfig` without mutating it, making a sub-agent a
-  one-liner. `context_window` pairs with `base_url`: for a self-hosted model it
+- **Eight flat overrides on `Agent(...)`** — `system_prompt`, `max_turns`,
+  `max_budget_usd`, `temperature`, `api_key`, `base_url`, `context_window`,
+  `memory` — which override a passed `AgentConfig` without mutating it, making a
+  sub-agent a one-liner. `context_window` pairs with `base_url`: for a self-hosted model it
   is required rather than exotic. A test asserts the list cannot drift from the
   dataclass fields.
 - **`AgentConfig.to_dict()` / `from_dict()` / `from_env()`** for config files,
@@ -122,6 +221,14 @@ Other behaviour changes:
 
 ### Fixed
 
+- **Memory facts are matched by whole words in any script.** Matching used
+  ASCII substrings: a Turkish query ("faturalar", "İstanbul") matched nothing,
+  while "art" matched "party".
+- **`None` is no longer redacted in traces.** A setting left automatic
+  (`max_context_tokens=None`) reached the session span as `"[REDACTED]"`
+  because its key contains "token".
+- **The SQLite backend no longer loses an in-memory database** — it opened a
+  new connection per operation — and its connection can now be closed.
 - **MCP servers over HTTP connect again.** Every `transport="http"` connection
   failed with `TypeError: streamable_http_client() got an unexpected keyword
   argument 'headers'`: the SDK renamed its streamable HTTP client and changed
@@ -157,8 +264,8 @@ Other behaviour changes:
   `ask_user` and MCP tools from each of them.
 - **An uncatalogued model no longer budgets its context silently wrong.** It
   used to inherit the provider's 200k fallback, so a locally served 8k model
-  never triggered compaction and overflowed at the endpoint. Construction now
-  warns and names `context_window=` as the fix.
+  never trimmed and overflowed at the endpoint. Construction now warns and
+  names `context_window=` as the fix.
 
 ## [0.1.0]
 

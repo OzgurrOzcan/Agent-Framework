@@ -10,6 +10,12 @@ variant is a one-liner and nothing has to be rebuilt by hand:
 
     summarizer = Agent(base_config, system_prompt="Summarize.", max_turns=2)
 
+An agent is stateless by default: every run starts from an empty history.
+`memory=MemoryConfig()` keeps the conversation across runs (in RAM), and
+`MemoryConfig(store="app.db")` adds long-term memory in SQLite:
+
+    chat = Agent("claude-opus-5", memory=MemoryConfig())
+
 The execution surface is deliberately small — two mental models, one method
 each:
 
@@ -34,10 +40,12 @@ import hashlib
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, Iterable
+from datetime import timedelta
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from agent_framework.core.config import AgentConfig
+from agent_framework.core.config import AgentConfig, MemoryConfig
+from agent_framework.core.context_filter import ContextFilter
 from agent_framework.core.context_manager import ContextManager
 from agent_framework.core.loop import AgentLoop, AgentResult
 from agent_framework.core.message import AnyMessage, message_from_dict
@@ -45,16 +53,37 @@ from agent_framework.core.policy import LoopPolicy
 from agent_framework.interrupts.manager import InterruptManager
 from agent_framework.interrupts.renderers.base import UIRenderer
 from agent_framework.mcp.registry import MCPServerRegistry
+from agent_framework.memory.backends.base import LongTermBackend
+from agent_framework.memory.backends.sqlite import SQLiteBackend
+from agent_framework.memory.long_term import LongTermMemory
 from agent_framework.memory.manager import MemoryManager
+from agent_framework.memory.sessions import (
+    ConversationSession,
+    SessionStore,
+    SessionTakenOverError,
+    tool_set_fingerprint,
+)
+from agent_framework.memory.short_term import ContextState
+from agent_framework.memory.summaries import Summarizer
 from agent_framework.permissions.config import PermissionConfig
 from agent_framework.permissions.resolver import PermissionResolver
 from agent_framework.providers.base import BaseProviderAdapter, StreamChunk, ToolChoice
+from agent_framework.providers.catalog import (
+    ProviderResolutionError,
+    resolve_model,
+    split_model_id,
+)
 from agent_framework.tools.builtin.ask_user import ask_user_tool
 from agent_framework.tools.executor import ToolExecutor
 from agent_framework.tools.models import Tool
 from agent_framework.tools.registry import ToolRegistry, to_registry
 from agent_framework.tracing.cost import CostTracker, PricingTable
-from agent_framework.tracing.trace import EventType, ExecutionTrace
+from agent_framework.tracing.trace import (
+    ErrorInfo,
+    EventType,
+    ExecutionTrace,
+    SpanStatus,
+)
 
 CheckpointId = str
 
@@ -84,8 +113,10 @@ _CONFIG_OVERRIDES = (
     "api_key",
     "base_url",
     # Pairs with base_url: a self-hosted endpoint's window is not in the
-    # catalog, and getting it wrong means compaction never fires.
+    # catalog, and getting it wrong means trimming never fires.
     "context_window",
+    # None (the default) = stateless; a MemoryConfig keeps the conversation.
+    "memory",
 )
 
 
@@ -104,11 +135,14 @@ class Agent:
         api_key: str | None = _UNSET,
         base_url: str | None = _UNSET,
         context_window: int | None = _UNSET,
+        memory: MemoryConfig | None = _UNSET,
         # --- wiring ---
         tools: ToolRegistry | Iterable[Tool] | None = None,
         permissions: PermissionConfig | None = None,
         mcp: MCPServerRegistry | None = None,
-        memory: MemoryManager | None = None,
+        memory_backend: LongTermBackend | None = None,
+        session_id: str | None = None,
+        context_filter: ContextFilter | None = None,
         trace: ExecutionTrace | None = None,
         pricing: PricingTable | None = None,
         agent_id: str | None = None,
@@ -124,9 +158,11 @@ class Agent:
             config: a model id (``"claude-opus-5"``, ``"openai:llama-3.3-70b"``)
                 or an `AgentConfig`.
             system_prompt, max_turns, max_budget_usd, temperature, api_key,
-                base_url, context_window: override the corresponding
+                base_url, context_window, memory: override the corresponding
                 `AgentConfig` field. Anything not listed here is set on an
-                `AgentConfig` instead.
+                `AgentConfig` instead. `memory=None` (the default) makes the
+                agent stateless; `memory=MemoryConfig(...)` keeps the
+                conversation.
             tools: `Tool` objects (from `@tool`) or a `ToolRegistry`. Copied,
                 so a registry shared between agents is never mutated.
             permissions: rules and the renderer that answers `ASK` prompts.
@@ -134,7 +170,16 @@ class Agent:
                 deferred to the first run, and a failing server is recorded in
                 the trace and skipped. Use `await Agent.connect(...)` to
                 discover eagerly and raise on any failure instead.
-            memory, trace, pricing: injected subsystems; sensible defaults are
+            memory_backend: a custom long-term backend instead of SQLite
+                (advanced). Requires `memory=MemoryConfig(...)` without a
+                `store`.
+            session_id: which conversation this agent saves and resumes.
+                Defaults to a fresh id per agent; it is recorded in the trace.
+            context_filter: ``fn(messages, info) -> messages`` (sync or
+                async), called before every LLM call to change what is sent —
+                never what is stored (advanced; see
+                `agent_framework.core.context_filter`).
+            trace, pricing: injected subsystems; sensible defaults are
                 built when omitted.
             agent_id: stable id for traces; generated when omitted.
             parent_permissions: when building a sub-agent, the parent's
@@ -152,7 +197,18 @@ class Agent:
             api_key=api_key,
             base_url=base_url,
             context_window=context_window,
+            memory=memory,
         )
+        _validate_memory(self.config.memory, memory_backend)
+        self._summary_model = _summary_model(self.config)
+        if session_id is not None and (not isinstance(session_id, str) or not session_id.strip()):
+            raise ValueError(f"session_id must be a non-empty string, got {session_id!r}")
+        if context_filter is not None and not callable(context_filter):
+            raise TypeError(
+                "context_filter must be a function (messages, info) -> messages, got "
+                f"{type(context_filter).__name__}"
+            )
+        self._context_filter = context_filter
 
         # Copy the tools: registering `ask_user` (and later the MCP tools)
         # must not reach into a registry the caller may share between agents.
@@ -178,7 +234,11 @@ class Agent:
         self._trace = trace or ExecutionTrace(agent_id=self.agent_id)
         self._cost = CostTracker(pricing=pricing or PricingTable.default())
         self._tools = registry
-        self._memory = memory or MemoryManager()
+        # Never the trace's id: two agents may share one trace, and must not
+        # share — and interleave — one conversation.
+        self.session_id = session_id or f"sess_{uuid.uuid4().hex[:16]}"
+        self._memory_backend = memory_backend
+        self._memory = _build_memory(self.config.memory, memory_backend, self._trace)
         self._permissions_cfg = perms
         self._renderer = renderer
         self._provider = provider if provider is not None else _build_provider(self.config)
@@ -204,29 +264,65 @@ class Agent:
             perms,
             interrupt_manager=self._interrupts,
             trace=self._trace,
-            session_id=self._trace.session_id,
+            session_id=self.session_id,
         )
         self._executor = ToolExecutor(
             trace=self._trace,
             interrupt_manager=self._interrupts,
-            session_id=self._trace.session_id,
+            session_id=self.session_id,
             max_parallel=self.config.max_parallel_tools,
+            default_max_result_tokens=self.config.resolved_max_tool_result_tokens,
         )
         # Built once: the prompt must stay byte-stable for prompt caching, and
         # the session span fingerprints exactly this text.
         self._system_prompt = self._build_system_prompt()
+        # Saved conversation, when the long-term store keeps sessions. Loaded
+        # once before the first run, saved after every run.
+        self._session = _build_session(
+            self.config.memory, self._memory, self.session_id, owner=f"{self.agent_id}/{uuid.uuid4().hex}"
+        )
+        self._session_ready = self._session is None
+        self._session_lock = asyncio.Lock()
+        # With a log to write, messages leaving the history unlogged are held.
+        self._memory.short_term.track_unlogged = self._session is not None
+        # Long-term summaries live next to the sessions they come from.
+        self._summarizer = (
+            Summarizer(
+                provider=self._provider,
+                model=self._summary_model,
+                session=self._session,
+                cost=self._cost,
+                trace=self._trace,
+                auto=self.config.memory.summarize if self.config.memory else False,
+                # The summary heads every new conversation; no trim removes it.
+                budget_tokens=self.config.resolved_max_context_tokens // 5,
+                idle_after=timedelta(minutes=self.config.memory.idle_after_minutes),
+                idle_per_start=self.config.memory.idle_summaries_per_start,
+                retention=(
+                    timedelta(days=self.config.memory.retention_days)
+                    if self.config.memory.retention_days is not None
+                    else None
+                ),
+            )
+            if self._session is not None and self.config.memory is not None
+            else None
+        )
+        self._memory.set_summarize(self._summarize_now, self._summarize_idle_now)
         self._context_manager = ContextManager(
             system_prompt=self._system_prompt,
-            context_window=self.config.resolved_context_window,
-            response_buffer_tokens=self.config.response_buffer_tokens,
-            compaction_buffer_tokens=self.config.compaction_buffer_tokens,
-            compaction=self.config.compaction,
+            max_context_tokens=self.config.resolved_max_context_tokens,
+            max_tool_result_tokens=self.config.resolved_max_tool_result_tokens,
+            tools=registry,
             memory=self._memory,
             trace=self._trace,
-            summarizer=self._provider,
-            summarizer_model=self.config.model,
+            context_filter=context_filter,
+            binds_reasoning=self.config.reasoning_binds_to_prefix,
+            model=self.config.model,
+            summarizer=self._summarizer,
+            usable_tokens=self.config.usable_context_tokens,
         )
         self._checkpoints: dict[CheckpointId, dict[str, Any]] = {}
+        self._native_clearing = _native_clearing_available(self.config, self._provider)
 
         self._record_session_span()
 
@@ -242,6 +338,8 @@ class Agent:
             cost_tracker=self._cost,
             trace=self._trace,
             agent_id=self.agent_id,
+            retain_history=self.config.memory is not None,
+            native_clearing=self._native_clearing,
         )
 
     # ===================== async construction =====================
@@ -261,12 +359,17 @@ class Agent:
         than serving a silently reduced toolset. (The plain constructor defers
         discovery to the first run, where a failing server is recorded in the
         trace and skipped instead — errors inside a run are never raised.)
-        Takes the same arguments as `Agent(...)`.
+        Takes the same arguments as `Agent(...)`. With `MemoryConfig(store=...)`
+        the saved conversation of `session_id` is loaded here as well.
         """
         tools = ToolRegistry(to_registry(kwargs.pop("tools", None)))
         for discovered in await mcp.discover_all(strict=True):
             tools.add(discovered)
-        return cls(config, tools=tools, mcp=mcp, _mcp_discovered=True, **kwargs)
+        agent = cls(config, tools=tools, mcp=mcp, _mcp_discovered=True, **kwargs)
+        # A saved conversation is loaded now too, so get_history() shows it
+        # before the first run.
+        await agent._ensure_session()
+        return agent
 
     async def _ensure_mcp(self) -> None:
         """Discover MCP tools once, before the first provider call."""
@@ -303,6 +406,7 @@ class Agent:
         max_turns: int | None = None,
         max_tool_rounds: int | None = None,
         tool_choice: ToolChoice | None = None,
+        dry_run: bool = False,
     ) -> AgentResult:
         """Run the agent loop.
 
@@ -313,16 +417,30 @@ class Agent:
             (bounded by max_turns).
           - tool_choice: constrain the FIRST model call ("any"/"tool" force
             tool use once; later turns fall back to auto).
+          - dry_run: build what the first call would send — trimmed if it
+            would be — and return it as `result.messages` with
+            `result.context`, without calling the model, summarizing or
+            saving. The stored history is untouched.
+
+        `result.context` reports what the last call was sent: message counts,
+        the token estimate, cleared results and the provider's cache hits.
+
+        Raises `SessionTakenOverError` (before any model call) once another
+        agent has opened this agent's session; see `memory.sessions`.
         """
         await self._ensure_mcp()
-        return await self._loop.run(
-            user_input,
-            policy=self._run_policy(
-                max_turns=max_turns,
-                max_tool_rounds=max_tool_rounds,
-                tool_choice=tool_choice,
-            ),
+        policy = self._run_policy(
+            max_turns=max_turns,
+            max_tool_rounds=max_tool_rounds,
+            tool_choice=tool_choice,
         )
+        await self._ensure_session()
+        if dry_run:
+            return await self._loop.dry_run(user_input, policy=policy)
+        try:
+            return await self._loop.run(user_input, policy=policy)
+        finally:
+            await self._flush_session()
 
     async def run_stream(
         self,
@@ -339,21 +457,26 @@ class Agent:
         its spans end as cancelled and the agent is immediately reusable.
         """
         await self._ensure_mcp()
-        # aclosing: without it, closing this generator leaves the loop's own
-        # generator suspended, so its "run in progress" flag is never cleared
-        # and every later run() on this agent raises.
-        async with contextlib.aclosing(
-            self._loop.stream(
-                user_input,
-                policy=self._run_policy(
-                    max_turns=max_turns,
-                    max_tool_rounds=max_tool_rounds,
-                    tool_choice=tool_choice,
-                ),
-            )
-        ) as chunks:
-            async for c in chunks:
-                yield c
+        await self._ensure_session()
+        try:
+            # aclosing: without it, closing this generator leaves the loop's
+            # own generator suspended, so its "run in progress" flag is never
+            # cleared and every later run() on this agent raises.
+            async with contextlib.aclosing(
+                self._loop.stream(
+                    user_input,
+                    policy=self._run_policy(
+                        max_turns=max_turns,
+                        max_tool_rounds=max_tool_rounds,
+                        tool_choice=tool_choice,
+                    ),
+                )
+            ) as chunks:
+                async for c in chunks:
+                    yield c
+        finally:
+            # Also when the consumer closes the stream early.
+            await self._flush_session()
 
     async def complete(
         self,
@@ -368,15 +491,19 @@ class Agent:
         tools should actually execute.
         """
         await self._ensure_mcp()
-        return await self._loop.run(
-            user_input,
-            policy=LoopPolicy(
-                max_turns=1,
-                execute_tools=False,
-                max_tool_rounds=0,
-                tool_choice=tool_choice,
-            ),
-        )
+        await self._ensure_session()
+        try:
+            return await self._loop.run(
+                user_input,
+                policy=LoopPolicy(
+                    max_turns=1,
+                    execute_tools=False,
+                    max_tool_rounds=0,
+                    tool_choice=tool_choice,
+                ),
+            )
+        finally:
+            await self._flush_session()
 
     # ===================== structured output (optional) =====================
     async def to_json(self, prompt: str, *, schema: Any) -> Any:
@@ -387,10 +514,28 @@ class Agent:
 
     # ===================== inspection =====================
     def get_history(self) -> list[AnyMessage]:
+        """The stored conversation. Without memory: the last run's messages."""
         return self._memory.short_term.snapshot()
 
-    def clear_history(self) -> None:
+    async def clear_history(self) -> None:
+        """Forget the conversation (messages and context state).
+
+        With a store, the emptied conversation is saved too, so resuming the
+        same session_id later starts from nothing rather than the old history.
+        """
+        await self._ensure_mcp()  # the saved fingerprint covers the MCP tools
+        self._check_ownership()
+        async with self._session_lock:
+            if not self._session_ready and self._session is not None:
+                # Never loaded: continue its log numbering, but not its history.
+                try:
+                    await self._session.load_counters()
+                except Exception as exc:
+                    self._session_unreadable(exc)
+            # Never load the old conversation after this.
+            self._session_ready = True
         self._memory.short_term.clear()
+        await self._flush_session()
 
     def get_trace(self) -> ExecutionTrace:
         return self._trace
@@ -414,22 +559,149 @@ class Agent:
     # ===================== checkpointing =====================
     def checkpoint(self) -> CheckpointId:
         cid = f"ckpt_{uuid.uuid4().hex[:12]}"
+        short_term = self._memory.short_term
         self._checkpoints[cid] = {
-            "messages": [m.to_dict() for m in self._memory.short_term.snapshot()],
+            "messages": [m.to_dict() for m in short_term.snapshot()],
+            # Without it a restored history would be rendered as if never
+            # trimmed: cleared results back in full, cut reasoning back in.
+            "context_state": short_term.state.to_dict(),
             "cost": self._cost.total_cost_usd,
         }
         return cid
 
     def restore(self, checkpoint_id: CheckpointId) -> None:
-        """Full-fidelity restore: tool_calls, tool results, reasoning and
-        metadata all survive the round-trip (see `message_from_dict`)."""
+        """Full-fidelity restore: tool_calls, tool results, reasoning,
+        metadata and the context state all survive the round-trip."""
         ckpt = self._checkpoints.get(checkpoint_id)
         if ckpt is None:
             raise KeyError(f"Unknown checkpoint: {checkpoint_id}")
         self._memory.short_term.replace_all(
-            message_from_dict(raw) for raw in ckpt["messages"]
+            (message_from_dict(raw) for raw in ckpt["messages"]),
+            state=ContextState.from_dict(ckpt.get("context_state")),
         )
         self._cost.total_cost_usd = ckpt.get("cost", self._cost.total_cost_usd)
+
+    # ===================== sessions =====================
+    async def _summarize_now(self) -> bool:
+        """`await agent.memory.summarize()`: save, then summarize what this
+        conversation added since its last summary (one LLM call, or none
+        when there is nothing new). False without long-term summaries."""
+        if self._summarizer is None:
+            return False
+        if self._loop._running:
+            raise RuntimeError(
+                "memory.summarize() was called while a run is in progress; it saves "
+                "and summarizes the conversation, so call it between runs."
+            )
+        await self._ensure_mcp()  # the session fingerprint covers the MCP tools
+        await self._ensure_session()
+        if self._session is None:  # it could not be read: nothing to summarize safely
+            return False
+        await self._flush_session()
+        return await self._summarizer.summarize_session()
+
+    async def _summarize_idle_now(self, limit: int) -> int:
+        """`await agent.memory.summarize_idle(limit)`: work through the
+        namespace's idle, unsummarized conversations (not this one)."""
+        if self._summarizer is None:
+            return 0
+        return await self._summarizer.summarize_idle(limit)
+
+    def _check_ownership(self) -> None:
+        """Refuse to go on with a session another agent has taken over."""
+        if self._session is not None and self._session.taken_over:
+            raise SessionTakenOverError(self._session._taken_over_message())
+
+    def _fingerprint(self) -> str:
+        return tool_set_fingerprint(self._system_prompt, self._tools)
+
+    async def _ensure_session(self) -> None:
+        """Load the saved conversation of `session_id` once, before the first run.
+
+        A store that cannot be read is recorded and the run continues from an
+        empty history — but nothing is saved for this agent afterwards, so
+        the conversation in the store is never overwritten by a fresh one.
+        """
+        self._check_ownership()
+        if self._session_ready:
+            return
+        async with self._session_lock:
+            if self._session_ready or self._session is None:
+                return
+            session = self._session
+            try:
+                resumed, reasoning_dropped = await session.load(
+                    self._memory.short_term, self._fingerprint()
+                )
+            except Exception as exc:
+                self._session_unreadable(exc)
+            else:
+                self._trace.record_event(
+                    EventType.MEMORY_READ,
+                    name="session",
+                    payload={
+                        "session_id": self.session_id,
+                        "resumed": resumed,
+                        "messages": len(self._memory.short_term),
+                        # The prompt or tool set changed since it was saved:
+                        # reasoning bound to the old ones is left out.
+                        "reasoning_dropped": reasoning_dropped,
+                    },
+                )
+            self._session_ready = True
+
+    def _session_unreadable(self, exc: BaseException) -> None:
+        """The stored session could not be read: write nothing for it again.
+
+        Its numbering and summary marker are unknown, so saving or summarizing
+        would overwrite or double-count what the store holds.
+        """
+        if self._session is not None:
+            self._session.broken = True  # the summarizer holds it too
+        self._session = None
+        self._trace.record_event(
+            EventType.ERROR,
+            name="session_load_failed",
+            status=SpanStatus.ERROR,
+            payload={"session_id": self.session_id},
+            error=ErrorInfo.from_exception(exc),
+        )
+
+    async def _flush_session(self) -> None:
+        """Save the conversation after a run. Failures are traced, not raised."""
+        if self._session is None or not self._session_ready:
+            return
+        try:
+            logged = await self._session.flush(self._memory.short_term, self._fingerprint())
+        except SessionTakenOverError as exc:
+            # Another agent owns the session now. Recorded here; the next
+            # run(), complete(), run_stream() or summarize() raises it.
+            self._trace.record_event(
+                EventType.ERROR,
+                name="session_taken_over",
+                status=SpanStatus.ERROR,
+                payload={"session_id": self.session_id},
+                error=ErrorInfo.from_exception(exc),
+            )
+            return
+        except Exception as exc:
+            self._trace.record_event(
+                EventType.ERROR,
+                name="session_save_failed",
+                status=SpanStatus.ERROR,
+                payload={"session_id": self.session_id},
+                error=ErrorInfo.from_exception(exc),
+            )
+            return
+        self._trace.record_event(
+            EventType.MEMORY_WRITE,
+            name="session",
+            payload={
+                "session_id": self.session_id,
+                "logged": logged,
+                "messages": len(self._memory.short_term),
+            },
+        )
 
     # ===================== internals =====================
     def _record_session_span(self) -> None:
@@ -476,6 +748,23 @@ class Agent:
             # silently disables max_budget_usd — worth knowing per run.
             pricing_resolved=self._cost.pricing.get(self.config.model) is not None,
             framework_version=_framework_version(),
+            # The conversation this agent saves and resumes. Not the span's
+            # own `session_id`, which is the trace's.
+            session_id=self.session_id,
+            retain_history=self.config.memory is not None,
+            memory_backend=(
+                type(self._memory_backend).__name__
+                if self._memory_backend is not None
+                else None
+            ),
+            native_tool_result_clearing=self._native_clearing,
+            reasoning_binds_to_prefix=self.config.reasoning_binds_to_prefix,
+            summary_model=self._summary_model if self._summarizer is not None else None,
+            context_filter=(
+                getattr(self._context_filter, "__qualname__", type(self._context_filter).__name__)
+                if self._context_filter is not None
+                else None
+            ),
         )
         self._trace.record_event(EventType.SESSION, name="session", payload=payload)
 
@@ -549,6 +838,128 @@ def _resolve_config(config: str | AgentConfig, **overrides: Any) -> AgentConfig:
             f"{type(config).__name__}."
         )
     return config.replace(**supplied) if supplied else config
+
+
+def _native_clearing_available(config: AgentConfig, provider: BaseProviderAdapter) -> bool:
+    """Whether to ask the provider to clear old tool results server-side.
+
+    On for adapters that support it, talking to the vendor's own API. Off
+    for a custom `base_url` — a gateway or proxy may not forward the beta —
+    and when `request_extra` already carries the caller's own
+    `context_management`, which is theirs to control.
+    """
+    return (
+        bool(getattr(provider, "supports_tool_result_clearing", False))
+        and config.base_url is None
+        and "context_management" not in (config.request_extra or {})
+    )
+
+
+def _validate_memory(memory: MemoryConfig | None, backend: LongTermBackend | None) -> None:
+    """Reject memory settings that would silently do nothing.
+
+    Lives here, not in `MemoryConfig`: whether long-term memory exists depends
+    on `memory_backend`, which is wiring and never part of a config.
+    """
+    if backend is not None:
+        if not isinstance(backend, LongTermBackend):
+            raise TypeError(
+                "memory_backend must be a LongTermBackend, got "
+                f"{type(backend).__name__}."
+            )
+        if memory is None:
+            raise ValueError(
+                "memory_backend= needs memory=MemoryConfig(...): an agent is "
+                "stateless unless memory is turned on."
+            )
+        if memory.store is not None:
+            raise ValueError(
+                "Pass either MemoryConfig(store=...) or memory_backend=, not "
+                "both: each one is the long-term store."
+            )
+        return
+    if memory is not None and memory.store is None:
+        unused = memory.long_term_settings()
+        if unused:
+            raise ValueError(
+                f"MemoryConfig.{', MemoryConfig.'.join(unused)} only apply to "
+                "long-term memory: also set MemoryConfig(store='<file>.db') or "
+                "pass memory_backend=."
+            )
+
+
+def _build_memory(
+    memory: MemoryConfig | None,
+    backend: LongTermBackend | None,
+    trace: ExecutionTrace,
+) -> MemoryManager:
+    """The agent's memory: short-term always, long-term when configured.
+
+    A stateless agent (no MemoryConfig) never opens a store. A store path
+    builds a SQLiteBackend that the manager owns — `await agent.memory.close()`
+    closes it; a backend passed in stays the caller's to close.
+    """
+    if memory is None:
+        return MemoryManager(trace=trace)
+    owns = False
+    if backend is None and memory.store is not None:
+        backend = SQLiteBackend(memory.store)
+        owns = True
+    long_term = (
+        LongTermMemory(backend=backend, namespace=memory.namespace)
+        if backend is not None
+        else None
+    )
+    return MemoryManager(long_term=long_term, owns_backend=owns, trace=trace)
+
+
+def _summary_model(config: AgentConfig) -> str:
+    """The model long-term summaries are written with (its wire name).
+
+    It is called through the agent's own adapter, so it must belong to the
+    agent's provider; a model of another provider is rejected here rather
+    than failing on the first summary.
+    """
+    requested = config.memory.summary_model if config.memory is not None else None
+    if requested is None:
+        return config.model
+    prefix, bare = split_model_id(requested)
+    if prefix is None:
+        try:
+            spec, bare = resolve_model(requested)
+        except ProviderResolutionError:
+            if config.provider == "openai" and config.base_url:
+                return bare  # an endpoint's own model name, as for the agent
+            raise
+        prefix = spec.name
+    if prefix != config.provider:
+        raise ValueError(
+            f"MemoryConfig.summary_model={requested!r} belongs to provider "
+            f"{prefix!r}, but this agent uses {config.provider!r}; summaries are "
+            "written through the agent's own connection. Pick a model of the "
+            "same provider (or leave summary_model unset)."
+        )
+    return bare
+
+
+def _build_session(
+    memory: MemoryConfig | None, manager: MemoryManager, session_id: str, *, owner: str
+) -> ConversationSession | None:
+    """The saved conversation, if the long-term store keeps sessions."""
+    if memory is None or manager.long_term is None:
+        return None
+    backend = manager.long_term.backend
+    if not isinstance(backend, SessionStore):
+        warnings.warn(
+            f"{type(backend).__name__} does not implement SessionStore, so "
+            "conversations are not saved or resumed — only its facts are used. "
+            "Implement SessionStore to keep sessions.",
+            stacklevel=3,
+        )
+        return None
+    return ConversationSession(
+        backend, namespace=manager.long_term.namespace, session_id=session_id, owner=owner
+    )
 
 
 def _build_provider(config: AgentConfig) -> BaseProviderAdapter:

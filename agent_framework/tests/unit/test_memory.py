@@ -4,7 +4,7 @@ from agent_framework.memory.backends.in_memory import InMemoryBackend
 from agent_framework.memory.long_term import LongTermMemory
 from agent_framework.memory.manager import MemoryManager
 from agent_framework.memory.short_term import ShortTermMemory
-from agent_framework.core.message import UserMessage, AssistantMessage, ToolResultMessage, ToolResult
+from agent_framework.core.message import UserMessage, AssistantMessage
 
 
 @pytest.mark.asyncio
@@ -57,28 +57,6 @@ def test_short_term_append_and_snapshot():
     assert snapshot[0].role == "user"
 
 
-def test_short_term_max_messages_trim():
-    st = ShortTermMemory(max_messages=3)
-    for i in range(5):
-        st.append(UserMessage(content=f"message {i}"))
-    assert len(st) == 3
-
-
-def test_short_term_clears_orphan_tool_results():
-    """After trim, a leading ToolResultMessage with no parent is dropped."""
-    st = ShortTermMemory(max_messages=2)
-    # Add messages such that after trimming, a tool result is orphaned.
-    tr = ToolResult(tool_use_id="id1", name="t", content="r")
-    st.append(AssistantMessage(content="", tool_calls=[]))  # This will be trimmed.
-    st.append(ToolResultMessage(content=[tr]))
-    st.append(UserMessage(content="next message"))
-    # After trim to 2: [ToolResultMessage, UserMessage]
-    # ToolResultMessage is leading → gets healed away.
-    msgs = st.snapshot()
-    # Should not start with a ToolResultMessage
-    assert not isinstance(msgs[0], ToolResultMessage)
-
-
 @pytest.mark.asyncio
 async def test_memory_manager_relevant_facts():
     backend = InMemoryBackend()
@@ -89,3 +67,47 @@ async def test_memory_manager_relevant_facts():
     facts = await mm.relevant_facts("I want to build a Python agent")
     keys = [f["key"] for f in facts]
     assert "python_version" in keys or "user_goal" in keys
+
+
+# ---------------- whole-word, Unicode-aware fact matching ----------------
+
+async def _manager_with(*facts: tuple[str, str]) -> MemoryManager:
+    lt = LongTermMemory(backend=InMemoryBackend())
+    for key, value in facts:
+        await lt.remember(key, value)
+    return MemoryManager(long_term=lt)
+
+
+async def test_turkish_query_finds_the_matching_fact():
+    mm = await _manager_with(
+        ("odeme_gunu", "Bekleyen faturalar her ayın 5'inde ödenir."),
+        ("sube", "Merkez ofis İstanbul'da."),
+    )
+    found = await mm.relevant_facts("FATURALAR ne zaman ödeniyor?")
+    assert [f["key"] for f in found] == ["odeme_gunu"]
+    # A dotted capital I folds to the "i" users type.
+    found = await mm.relevant_facts("istanbul ofisi nerede")
+    assert [f["key"] for f in found] == ["sube"]
+
+
+async def test_whole_word_not_substring():
+    mm = await _manager_with(("event", "the party planning starts at noon"))
+    assert await mm.relevant_facts("show me some art") == []
+    assert [f["key"] for f in await mm.relevant_facts("party time?")] == ["event"]
+
+
+async def test_words_inside_keys_match():
+    mm = await _manager_with(("user_name", "Alice"), ("deployTarget", "eu-1 cluster"))
+    assert [f["key"] for f in await mm.relevant_facts("what is my name?")] == ["user_name"]
+    assert [f["key"] for f in await mm.relevant_facts("which target do we deploy to")] == [
+        "deployTarget"
+    ]
+
+
+async def test_more_shared_words_rank_higher():
+    mm = await _manager_with(
+        ("a", "python version is 3.12"),
+        ("b", "python packaging uses uv and python version pins"),
+    )
+    found = await mm.relevant_facts("which python version and packaging tool?")
+    assert [f["key"] for f in found] == ["b", "a"]

@@ -10,6 +10,8 @@ Usage:
         idempotent=True,
         cache_ttl_seconds=None,
         tags=["research", "web"],
+        max_result_tokens=4000,       # cut bigger results (head + tail)
+        clear_old_results=True,       # False = never cleared when trimming
     )
     async def web_search(
         query: Annotated[str, "The search phrase"],
@@ -47,7 +49,20 @@ def tool(
     cache_ttl_seconds: float | None = None,
     tags: Sequence[str] = (),
     name: str | None = None,
+    max_result_tokens: int | None = None,
+    clear_old_results: bool = True,
 ) -> Callable[[Callable[..., Any]], Tool]:
+    """Turn a function into a `Tool`.
+
+    `max_result_tokens` caps this tool's results when they are produced: a
+    larger result keeps its head and tail with a marker in between. None uses
+    the agent's default (`AgentConfig.max_tool_result_tokens`).
+
+    `clear_old_results=False` keeps this tool's old results in full when the
+    context is trimmed; by default they are replaced by a one-line note once
+    newer results exist.
+    """
+
     def decorator(fn: Callable[..., Any]) -> Tool:
         tool_name = name or fn.__name__
         desc = description or (inspect.getdoc(fn) or "").strip() or tool_name
@@ -64,6 +79,8 @@ def tool(
             tags=tuple(tags),
             is_async=inspect.iscoroutinefunction(fn),
             source="native",
+            max_result_tokens=max_result_tokens,
+            clear_old_results=clear_old_results,
         )
         return Tool(metadata=meta, fn=fn)
 

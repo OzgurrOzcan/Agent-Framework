@@ -12,9 +12,11 @@ Usage:
         ScriptedTurn(text="Here is what I found."),
     ])
 
-    # Plug into an agent by replacing its provider:
-    agent._provider = mock
-    agent._loop.provider = mock
+    # Plug it into an agent at construction (every component gets it):
+    agent = Agent("claude-opus-5", api_key="k", provider=mock)
+
+The mock is also the summarizer of a long-term store, so a script runs in
+call order: a trim's summary call comes before the call it trims for.
 """
 
 from __future__ import annotations
@@ -32,11 +34,13 @@ from agent_framework.core.message import (
     ToolCallRequest,
 )
 from agent_framework.providers.base import (
+    AppliedEdit,
     BaseProviderAdapter,
     NormalizedResponse,
     StreamChunk,
     StreamChunkType,
     ToolChoice,
+    ToolResultClearing,
 )
 from agent_framework.tools.models import ToolMetadata
 
@@ -53,12 +57,20 @@ class ScriptedTurn:
     reasoning: list[dict[str, Any]] = field(default_factory=list)
     # Raise this exception instead of returning a response.
     raise_exc: Exception | None = None
+    # Server-side context edits to report as applied (dicts as AppliedEdit takes).
+    applied_edits: list[dict[str, Any]] = field(default_factory=list)
 
 
 class MockLLMProvider(BaseProviderAdapter):
     name = "mock"
 
-    def __init__(self, script: list[ScriptedTurn] | None = None) -> None:
+    def __init__(
+        self,
+        script: list[ScriptedTurn] | None = None,
+        *,
+        supports_tool_result_clearing: bool = False,
+    ) -> None:
+        self.supports_tool_result_clearing = supports_tool_result_clearing
         self._script = list(script or [])
         self._call_count = 0
         self.call_log: list[dict[str, Any]] = []
@@ -81,15 +93,19 @@ class MockLLMProvider(BaseProviderAdapter):
         tool_choice: ToolChoice | None = None,
         enable_caching: bool = True,
         extra: dict[str, Any] | None = None,
+        context_edits: ToolResultClearing | None = None,
     ) -> NormalizedResponse:
         turn = self._next_turn()
         self.call_log.append({
+            "model": model,
             "system": system[:100],
+            "messages": list(messages),
             "message_count": len(messages),
             "tool_count": len(tools),
             "temperature": temperature,
             "tool_choice": tool_choice,
             "enable_caching": enable_caching,
+            "context_edits": context_edits,
         })
         if turn.raise_exc is not None:
             raise turn.raise_exc
@@ -114,6 +130,7 @@ class MockLLMProvider(BaseProviderAdapter):
             assistant_message=msg,
             stop_reason=stop_reason,
             usage=turn.usage,
+            applied_edits=[AppliedEdit.from_dict(e) for e in turn.applied_edits],
         )
 
     async def stream(
@@ -128,11 +145,13 @@ class MockLLMProvider(BaseProviderAdapter):
         tool_choice: ToolChoice | None = None,
         enable_caching: bool = True,
         extra: dict[str, Any] | None = None,
+        context_edits: ToolResultClearing | None = None,
     ) -> AsyncIterator[StreamChunk]:
         resp = await self.call(
             system=system, messages=messages, tools=tools,
             model=model, max_tokens=max_tokens, temperature=temperature,
             tool_choice=tool_choice, enable_caching=enable_caching, extra=extra,
+            context_edits=context_edits,
         )
         if resp.assistant_message.content:
             yield StreamChunk(
@@ -149,6 +168,9 @@ class MockLLMProvider(BaseProviderAdapter):
             payload={
                 "input_tokens": resp.usage.input_tokens,
                 "output_tokens": resp.usage.output_tokens,
+                "cache_read_input_tokens": resp.usage.cache_read_input_tokens,
+                "cache_creation_input_tokens": resp.usage.cache_creation_input_tokens,
+                "applied_edits": [e.to_dict() for e in resp.applied_edits],
             },
         )
         yield StreamChunk(

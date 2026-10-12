@@ -153,11 +153,13 @@ _SENSITIVE_KEY_RE = re.compile(
 def _default_redactor(key: str, value: Any) -> Any:
     """Replace values whose key looks sensitive with ``"[REDACTED]"``.
 
-    Plain numeric/bool values are never redacted: counters such as
-    ``ctx_tokens`` or ``reclaimed_tokens`` match the key pattern but
-    cannot be secrets.
+    Plain numeric/bool values and ``None`` are never redacted: counters such
+    as ``ctx_tokens`` or ``reclaimed_tokens`` match the key pattern but
+    cannot be secrets, and ``None`` is how a setting such as
+    ``max_context_tokens=None`` says "automatic" — hiding it would hide
+    whether the value was set at all, and it carries nothing to leak.
     """
-    if isinstance(value, (bool, int, float)):
+    if value is None or isinstance(value, (bool, int, float)):
         return value
     if _SENSITIVE_KEY_RE.search(key):
         return "[REDACTED]"
@@ -176,7 +178,7 @@ def redact_payload(
     values whose key contains ``password``, ``passwd``, ``token``, ``secret``,
     ``api_key``, ``apikey``, ``authorization`` or ``credential``
     (case-insensitive) with ``"[REDACTED]"``; plain numeric/bool values
-    (token counters etc.) are left intact. Pass ``redactor=lambda k, v: v``
+    (token counters etc.) and ``None`` are left intact. Pass ``redactor=lambda k, v: v``
     to disable redaction entirely.
     """
     return _redact_value(payload, redactor or _default_redactor)

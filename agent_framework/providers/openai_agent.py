@@ -32,6 +32,7 @@ from agent_framework.providers.base import (
     StreamChunk,
     StreamChunkType,
     ToolChoice,
+    ToolResultClearing,
 )
 from agent_framework.providers.streaming import StreamingToolAccumulator
 from agent_framework.tools.models import ToolMetadata
@@ -202,6 +203,8 @@ class OpenAIAdapter(BaseProviderAdapter):
         tool_choice: ToolChoice | None = None,
         enable_caching: bool = True,  # no-op: OpenAI caches automatically
         extra: dict[str, Any] | None = None,
+        # Never passed: supports_tool_result_clearing is False here.
+        context_edits: ToolResultClearing | None = None,
     ) -> NormalizedResponse:
         req = self._build_request(
             system=system, messages=messages, tools=tools, model=model,
@@ -256,6 +259,8 @@ class OpenAIAdapter(BaseProviderAdapter):
         tool_choice: ToolChoice | None = None,
         enable_caching: bool = True,  # no-op: OpenAI caches automatically
         extra: dict[str, Any] | None = None,
+        # Never passed: supports_tool_result_clearing is False here.
+        context_edits: ToolResultClearing | None = None,
     ) -> AsyncIterator[StreamChunk]:
         req = self._build_request(
             system=system, messages=messages, tools=tools, model=model,

@@ -6,11 +6,19 @@ construction, and serializable:
     AgentConfig(model="claude-opus-5", system_prompt="...", max_turns=6)
 
 The model id carries the provider (see `providers.catalog`), so nothing has
-to name a provider in the common case. Two nested records hold the knobs that
+to name a provider in the common case. One nested record holds the knobs that
 are genuinely rare, so the flat surface stays short:
 
   - `TransportConfig`: how we reach the API (timeouts, retries, SDK kwargs).
-  - `CompactionConfig`: the context-compaction pipeline's thresholds.
+
+Context management has two flat limits and no record of its own: the prompt
+is trimmed when it reaches `max_context_tokens`, and a tool result bigger than
+`max_tool_result_tokens` is cut when it arrives. Both default to values derived
+from the model's context window.
+
+An agent is stateless unless `memory` is set: every run starts from an empty
+history. `MemoryConfig()` keeps the conversation in RAM across runs;
+`MemoryConfig(store="app.db")` also keeps long-term memory in SQLite.
 
 Every setting lives in exactly one place. Tools, MCP, memory and permissions
 are wiring, not configuration, and are passed to `Agent(...)` directly.
@@ -21,6 +29,7 @@ from __future__ import annotations
 import os
 import warnings
 from dataclasses import asdict, dataclass, field, fields, replace
+from pathlib import PurePath
 from typing import Any
 
 from agent_framework.providers.catalog import (
@@ -36,7 +45,7 @@ __all__ = [
     "DEFAULT_CONTEXT_WINDOW",
     "LOCAL_API_KEY_PLACEHOLDER",
     "AgentConfig",
-    "CompactionConfig",
+    "MemoryConfig",
     "TransportConfig",
 ]
 
@@ -44,6 +53,28 @@ __all__ = [
 # configured. Local runtimes (vLLM, llama.cpp, Ollama) require the header to
 # exist but ignore its value.
 LOCAL_API_KEY_PLACEHOLDER = "not-needed"
+
+# Automatic context limits. The prompt is trimmed at 70 % of the window (never
+# above 150k, where long prompts get slow and expensive while rarely helping),
+# leaving room for the response and for the turn that triggers the trim.
+_AUTO_CONTEXT_SHARE = 0.70
+_AUTO_CONTEXT_CEILING = 150_000
+# A single tool result may use at most 10 % of the window, 16k tokens, or a
+# fifth of the trim limit — so a few recent results always fit after a trim.
+_AUTO_TOOL_RESULT_CEILING = 16_000
+# A trim brings the prompt down to this share of max_context_tokens (kept in
+# sync with core.context_manager.TRIM_TARGET_SHARE, which a test asserts).
+_TRIM_TARGET_SHARE = 0.60
+
+# Fields that existed before and what replaces them, so a stale config file
+# fails with a migration hint instead of a bare "unknown field".
+_REMOVED_FIELDS = {
+    "compaction": "replaced by max_context_tokens and max_tool_result_tokens",
+    "response_buffer_tokens": (
+        "removed: the usable window is context_window - max_tokens_per_response"
+    ),
+    "compaction_buffer_tokens": "removed: trimming makes no LLM call, so needs no headroom",
+}
 
 
 def _require(condition: bool, message: str) -> None:
@@ -76,40 +107,92 @@ class TransportConfig:
 
 
 @dataclass(frozen=True)
-class CompactionConfig:
-    """Thresholds for the context_manager compaction pipeline."""
+class MemoryConfig:
+    """Turns on conversation memory. Without one, every run starts fresh.
 
-    enabled: bool = True
-    trigger_ratio: float = 0.70  # compact when >70% of budget used
-    tool_result_truncate_threshold: int = 500  # tokens
-    sliding_window_min_turns: int = 6  # always keep at least N most-recent turns
-    full_compaction_min_recent_turns: int = 3
-    summary_max_tokens: int = 800
+        MemoryConfig()                                   # history kept in RAM
+        MemoryConfig(store="support.db", namespace="customer-42")   # + SQLite
+
+    `namespace`, `summarize` and `summary_model` describe long-term memory, so
+    they need a `store` (or a custom `Agent(memory_backend=...)`); `Agent`
+    rejects them without one rather than silently ignoring them.
+    """
+
+    # A SQLite file path → long-term memory. None = the history lives in RAM.
+    store: str | None = None
+    # Whose long-term memory this is: a user, a customer, a project.
+    namespace: str = "default"
+    # Long-term: summarize the turns a trim removes (one LLM call per trim).
+    summarize: bool = True
+    # Long-term: a cheaper model of the same provider for those summaries.
+    # None = the agent's own model.
+    summary_model: str | None = None
+    # Long-term: a conversation with no activity for this long is finished
+    # enough for its unsummarized part to be summarized by the next new
+    # conversation of the namespace (or by `memory.summarize_idle()`).
+    idle_after_minutes: int = 30
+    # Long-term: how many such idle conversations a new conversation
+    # summarizes before its first call (one LLM call each). 0 = none inline;
+    # run `memory.summarize_idle()` from a background job instead.
+    idle_summaries_per_start: int = 2
+    # Long-term: delete sessions idle for this many days whose whole log is
+    # in the summary, so the store does not grow forever. None = keep all.
+    retention_days: int | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.store, PurePath):
+            object.__setattr__(self, "store", str(self.store))
         _require(
-            0.0 < self.trigger_ratio <= 1.0,
-            f"compaction.trigger_ratio must be in (0, 1], got {self.trigger_ratio}",
+            self.store is None or (isinstance(self.store, str) and self.store.strip() != ""),
+            f"MemoryConfig.store must be a non-empty path or None, got {self.store!r}",
         )
         _require(
-            self.tool_result_truncate_threshold >= 0,
-            "compaction.tool_result_truncate_threshold must be >= 0, "
-            f"got {self.tool_result_truncate_threshold}",
+            isinstance(self.namespace, str) and self.namespace.strip() != "",
+            f"MemoryConfig.namespace must be a non-empty string, got {self.namespace!r}",
         )
         _require(
-            self.sliding_window_min_turns >= 1,
-            "compaction.sliding_window_min_turns must be >= 1, "
-            f"got {self.sliding_window_min_turns}",
+            isinstance(self.summarize, bool),
+            f"MemoryConfig.summarize must be a bool, got {self.summarize!r}",
         )
         _require(
-            self.full_compaction_min_recent_turns >= 1,
-            "compaction.full_compaction_min_recent_turns must be >= 1, "
-            f"got {self.full_compaction_min_recent_turns}",
+            self.summary_model is None
+            or (isinstance(self.summary_model, str) and self.summary_model.strip() != ""),
+            f"MemoryConfig.summary_model must be a model id or None, got {self.summary_model!r}",
         )
         _require(
-            self.summary_max_tokens >= 1,
-            f"compaction.summary_max_tokens must be >= 1, got {self.summary_max_tokens}",
+            _is_int(self.idle_after_minutes) and self.idle_after_minutes >= 1,
+            f"MemoryConfig.idle_after_minutes must be an int >= 1, got {self.idle_after_minutes!r}",
         )
+        _require(
+            _is_int(self.idle_summaries_per_start) and self.idle_summaries_per_start >= 0,
+            "MemoryConfig.idle_summaries_per_start must be an int >= 0, got "
+            f"{self.idle_summaries_per_start!r}",
+        )
+        _require(
+            self.retention_days is None
+            or (_is_int(self.retention_days) and self.retention_days >= 1),
+            f"MemoryConfig.retention_days must be an int >= 1 or None, got {self.retention_days!r}",
+        )
+
+    def long_term_settings(self) -> list[str]:
+        """The long-term-only fields that were changed from their defaults."""
+        defaults = MemoryConfig()
+        return [
+            name
+            for name in (
+                "namespace",
+                "summarize",
+                "summary_model",
+                "idle_after_minutes",
+                "idle_summaries_per_start",
+                "retention_days",
+            )
+            if getattr(self, name) != getattr(defaults, name)
+        ]
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 @dataclass(frozen=True)
@@ -148,9 +231,16 @@ class AgentConfig:
     temperature: float | None = None
     # None = resolve from the model id via the provider catalog.
     context_window: int | None = None
-    response_buffer_tokens: int = 8192  # leave headroom for the model's response
-    compaction_buffer_tokens: int = 4096  # leave headroom to run compaction itself
-    compaction: CompactionConfig = field(default_factory=CompactionConfig)
+    # The prompt (system + tools + messages) is trimmed when it reaches this
+    # size. None = min(70 % of the window, 150k, window - max_tokens_per_response).
+    max_context_tokens: int | None = None
+    # A tool result bigger than this is cut (head + tail) when it arrives;
+    # `@tool(max_result_tokens=...)` overrides it per tool. None = the smallest
+    # of 16k, 10 % of the window and a fifth of max_context_tokens.
+    max_tool_result_tokens: int | None = None
+    # None = stateless: every run starts from an empty history. A
+    # MemoryConfig keeps the conversation (see MemoryConfig).
+    memory: MemoryConfig | None = None
     transport: TransportConfig = field(default_factory=TransportConfig)
     environment: dict[str, str] = field(default_factory=dict)
     # Duplicate tool descriptions into the system prompt (<capabilities>
@@ -215,40 +305,73 @@ class AgentConfig:
             self.context_window is None or self.context_window >= 1024,
             f"context_window must be >= 1024 or None, got {self.context_window}",
         )
-        _require(
-            self.response_buffer_tokens >= 0,
-            f"response_buffer_tokens must be >= 0, got {self.response_buffer_tokens}",
-        )
-        _require(
-            self.compaction_buffer_tokens >= 0,
-            f"compaction_buffer_tokens must be >= 0, got {self.compaction_buffer_tokens}",
-        )
+        for name in ("max_context_tokens", "max_tool_result_tokens"):
+            value = getattr(self, name)
+            _require(
+                value is None
+                or (isinstance(value, int) and not isinstance(value, bool) and value >= 1),
+                f"{name} must be a positive int or None, got {value!r}",
+            )
         _require(
             self.max_parallel_tools >= 1,
             f"max_parallel_tools must be >= 1, got {self.max_parallel_tools}",
         )
+        if self.memory is not None and not isinstance(self.memory, MemoryConfig):
+            raise TypeError(
+                "memory must be a MemoryConfig or None, got "
+                f"{type(self.memory).__name__}. A custom long-term backend is "
+                "passed as Agent(..., memory_backend=...)."
+            )
         # An unrecognized model silently inherits the provider's fallback
-        # window. Budgeting a locally served 8k model as 200k means compaction
+        # window. Budgeting a locally served 8k model as 200k means trimming
         # never fires and the endpoint rejects the overflow instead.
         if self.context_window is None and spec.known_context_window(bare_model) is None:
             warnings.warn(
                 f"Unknown context window for model {bare_model!r}; assuming "
                 f"{spec.default_context_window} tokens. If the real window is "
-                "smaller, compaction will not fire in time and the provider "
+                "smaller, trimming will not fire in time and the provider "
                 "will reject the request — pass context_window=... to set it.",
                 stacklevel=3,
             )
 
-        # Buffers larger than the window leave a 1-token conversation budget
-        # (ContextManager.budget clamps), which compacts every single turn.
+        # The response shares the window with the prompt, so the prompt can
+        # use at most what the response leaves.
         window = self.resolved_context_window
-        buffers = self.response_buffer_tokens + self.compaction_buffer_tokens
         _require(
-            buffers < window,
-            f"response_buffer_tokens + compaction_buffer_tokens ({buffers}) must "
-            f"be less than the context window ({window}); otherwise no tokens "
-            "remain for the conversation and every turn triggers compaction.",
+            self.max_tokens_per_response < window,
+            f"max_tokens_per_response ({self.max_tokens_per_response}) must be "
+            f"less than the context window ({window}); otherwise no tokens remain "
+            "for the prompt. Lower max_tokens_per_response.",
         )
+        usable = self.usable_context_tokens
+        _require(
+            self.max_context_tokens is None or self.max_context_tokens <= usable,
+            f"max_context_tokens ({self.max_context_tokens}) must not exceed the "
+            f"usable window ({usable} = context_window {window} - "
+            f"max_tokens_per_response {self.max_tokens_per_response}); a prompt "
+            "that size leaves no room for the response.",
+        )
+        context_limit = self.resolved_max_context_tokens
+        _require(
+            self.max_tool_result_tokens is None
+            or self.max_tool_result_tokens <= context_limit,
+            f"max_tool_result_tokens ({self.max_tool_result_tokens}) must not "
+            f"exceed max_context_tokens ({context_limit}); one result that size "
+            "would fill the whole prompt.",
+        )
+        # A trim leaves 40 % of the limit to grow into. A single result larger
+        # than that triggers the next trim on its own, so trims (and prompt
+        # cache rebuilds) would follow every such result instead of being rare.
+        headroom = context_limit - int(context_limit * _TRIM_TARGET_SHARE)
+        if self.max_tool_result_tokens is not None and self.max_tool_result_tokens > headroom:
+            warnings.warn(
+                f"max_tool_result_tokens ({self.max_tool_result_tokens}) exceeds the "
+                f"{headroom} tokens a trim leaves free under max_context_tokens "
+                f"({context_limit}): each result that large can trigger another trim, "
+                "and with it a prompt-cache rebuild. Lower it, or raise "
+                "max_context_tokens.",
+                stacklevel=3,
+            )
 
     # ---------------- derived ----------------
     @property
@@ -262,6 +385,45 @@ class AgentConfig:
         if self.context_window is not None:
             return self.context_window
         return self.provider_spec.context_window(self.model)
+
+    @property
+    def reasoning_binds_to_prefix(self) -> bool:
+        """Whether the model rejects reasoning once earlier messages change.
+
+        Such a model is never trimmed client-side in the middle of a run.
+        """
+        return self.provider_spec.binds_reasoning_to_prefix(self.model)
+
+    @property
+    def usable_context_tokens(self) -> int:
+        """The most the prompt may use: the window minus the response's share."""
+        return self.resolved_context_window - self.max_tokens_per_response
+
+    @property
+    def resolved_max_context_tokens(self) -> int:
+        """The prompt size that triggers a trim (`max_context_tokens` or auto)."""
+        if self.max_context_tokens is not None:
+            return self.max_context_tokens
+        window = self.resolved_context_window
+        return min(
+            int(window * _AUTO_CONTEXT_SHARE),
+            _AUTO_CONTEXT_CEILING,
+            self.usable_context_tokens,
+        )
+
+    @property
+    def resolved_max_tool_result_tokens(self) -> int:
+        """The default cap on one tool result (`max_tool_result_tokens` or auto)."""
+        if self.max_tool_result_tokens is not None:
+            return self.max_tool_result_tokens
+        return max(
+            1,
+            min(
+                _AUTO_TOOL_RESULT_CEILING,
+                self.resolved_context_window // 10,
+                self.resolved_max_context_tokens // 5,
+            ),
+        )
 
     def resolved_api_key(self) -> str:
         """The API key, from `api_key` or the provider's environment variable.
@@ -303,6 +465,8 @@ class AgentConfig:
         data.pop("api_key", None)
         data["api_key_set"] = self.api_key is not None
         data["resolved_context_window"] = self.resolved_context_window
+        data["resolved_max_context_tokens"] = self.resolved_max_context_tokens
+        data["resolved_max_tool_result_tokens"] = self.resolved_max_tool_result_tokens
         return data
 
     @classmethod
@@ -314,18 +478,18 @@ class AgentConfig:
         """
         known = {f.name for f in fields(cls)}
         # Derived keys that to_dict() adds; they are outputs, not inputs.
-        payload = {
-            k: v
-            for k, v in data.items()
-            if k not in ("api_key_set", "resolved_context_window")
-        }
+        payload = {k: v for k, v in data.items() if k not in _DERIVED_KEYS}
+        removed = sorted(set(payload) & set(_REMOVED_FIELDS))
+        if removed:
+            hints = "; ".join(f"{name}: {_REMOVED_FIELDS[name]}" for name in removed)
+            raise ValueError(f"Removed AgentConfig field(s) — {hints}.")
         unknown = set(payload) - known
         if unknown:
             raise ValueError(
                 f"Unknown AgentConfig field(s): {', '.join(sorted(unknown))}. "
                 f"Valid fields: {', '.join(sorted(known))}."
             )
-        nested = {"compaction": CompactionConfig, "transport": TransportConfig}
+        nested = {"transport": TransportConfig, "memory": MemoryConfig}
         for key, factory in nested.items():
             value = payload.get(key)
             if isinstance(value, dict):
@@ -338,7 +502,7 @@ class AgentConfig:
 
         Reads the flat scalar fields only — `{prefix}MODEL`,
         `{prefix}SYSTEM_PROMPT`, `{prefix}MAX_TURNS`, and so on. The nested
-        `compaction` / `transport` records and the dict-valued fields are not
+        `transport` / `memory` records and the dict-valued fields are not
         env-configurable; pass them via *overrides*, which win over the
         environment. Empty variables are treated as unset, and a value that
         does not parse raises rather than falling back to the default.
@@ -353,8 +517,8 @@ class AgentConfig:
             "max_tokens_per_response": int,
             "stall_threshold": int,
             "context_window": int,
-            "response_buffer_tokens": int,
-            "compaction_buffer_tokens": int,
+            "max_context_tokens": int,
+            "max_tool_result_tokens": int,
             "max_parallel_tools": int,
             "max_budget_usd": float,
             "temperature": float,
@@ -381,6 +545,15 @@ class AgentConfig:
             )
         return cls(**kwargs)
 
+
+_DERIVED_KEYS = frozenset(
+    {
+        "api_key_set",
+        "resolved_context_window",
+        "resolved_max_context_tokens",
+        "resolved_max_tool_result_tokens",
+    }
+)
 
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})

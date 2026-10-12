@@ -25,9 +25,12 @@ class StopReason(str, enum.Enum):
     PAUSE_TURN = "pause_turn"
     # Safety classifiers declined the request (HTTP 200, not an error).
     REFUSAL = "refusal"
-    # The model hit the context-window limit (distinct from max_tokens).
+    # The model hit the context-window limit (distinct from max_tokens) — or
+    # the framework stopped a prompt that would not fit before sending it.
     CONTEXT_EXCEEDED = "model_context_window_exceeded"
     ERROR = "error"
+    # `run(dry_run=True)`: the view was built, no model was called.
+    DRY_RUN = "dry_run"
 
 
 @dataclass
@@ -94,12 +97,21 @@ class ToolResult:
     duration_ms: int | None = None
 
     def as_text(self) -> str:
-        if isinstance(self.content, str):
-            return self.content
-        try:
-            return json.dumps(self.content, default=str)
-        except Exception:
-            return str(self.content)
+        return content_as_text(self.content)
+
+
+def content_as_text(content: Any) -> str:
+    """The text a provider receives for a tool result's *content*.
+
+    Strings pass through; anything else is JSON-encoded (falling back to
+    `str()`), exactly as the adapters serialize it.
+    """
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, default=str)
+    except Exception:
+        return str(content)
 
 
 @dataclass

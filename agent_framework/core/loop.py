@@ -1,7 +1,8 @@
 """AgentLoop — the core Observe → Reason → Act → Observe while-loop.
 
 Design laws enforced here:
-  - Messages are the only durable state.
+  - Messages are the only durable state. Without memory (the default) a
+    run starts from an empty history; with it, the history carries over.
   - Errors are feedback, never crashes (denials, timeouts, exceptions,
     provider failures all become `ToolResult(is_error=True)` or an
     `AgentResult(error=...)` — never an unhandled traceback).
@@ -13,6 +14,14 @@ Design laws enforced here:
   - Each loop iteration is its own `turn[N]` span in the trace tree.
   - `pause_turn` continues the loop; `refusal` and context-window overflows
     terminate it with their own stop reasons.
+  - Nothing already sent is edited in the middle of a run on a model that
+    binds reasoning to the prefix (see `ProviderSpec.binds_reasoning_to_prefix`):
+    the history is trimmed only at a run's first call there. A call that
+    would not fit the window stops the run with CONTEXT_EXCEEDED *before*
+    it is sent, instead of surfacing the provider's 400. Where the provider
+    can clear old tool results server-side (Anthropic context editing), that
+    is requested on every call: it keeps long runs in bounds without editing
+    what was sent.
 """
 
 from __future__ import annotations
@@ -22,10 +31,15 @@ import contextlib
 import hashlib
 import json
 from dataclasses import dataclass, field
+from collections.abc import AsyncIterator
 from typing import Any, AsyncGenerator
 
 from agent_framework.core.config import AgentConfig
-from agent_framework.core.context_manager import ContextManager
+from agent_framework.core.context_manager import (
+    AssembledContext,
+    ContextManager,
+    ContextReport,
+)
 from agent_framework.core.message import (
     AnyMessage,
     AssistantMessage,
@@ -39,14 +53,28 @@ from agent_framework.core.message import (
 )
 from agent_framework.core.policy import (
     BudgetExceededError,
+    ContextWindowExceededError,
     LoopGuardError,
     LoopPolicy,
 )
 from agent_framework.memory.short_term import ShortTermMemory
 from agent_framework.permissions.models import Verdict
 from agent_framework.permissions.resolver import PermissionResolver
-from agent_framework.providers.base import BaseProviderAdapter, StreamChunk, StreamChunkType
-from agent_framework.tools.executor import ToolCancellationError, ToolExecutor
+from agent_framework.providers.base import (
+    AppliedEdit,
+    BaseProviderAdapter,
+    ContextEditsRejectedError,
+    NormalizedResponse,
+    StreamChunk,
+    StreamChunkType,
+    ToolResultClearing,
+)
+from agent_framework.tools.builtin.ask_user import ASK_USER_TOOL_NAME
+from agent_framework.tools.executor import (
+    ToolCancellationError,
+    ToolExecutor,
+    cap_result_content,
+)
 from agent_framework.tools.models import ToolMetadata
 from agent_framework.tools.registry import ToolRegistry
 from agent_framework.tracing.cost import CostTracker
@@ -86,6 +114,8 @@ class AgentResult:
     state: LoopState
     error: Exception | None = None
     trace: ExecutionTrace | None = None
+    # What the run's last LLM call was sent (with dry_run: would be sent).
+    context: ContextReport | None = None
 
     def __str__(self) -> str:
         return self.final_message
@@ -103,7 +133,9 @@ class AgentResult:
         return []
 
 
-def _policy_payload(policy: LoopPolicy, *, streaming: bool) -> dict[str, Any]:
+def _policy_payload(
+    policy: LoopPolicy, *, streaming: bool, retain_history: bool
+) -> dict[str, Any]:
     """The effective shape of one run, for the RUN span.
 
     `AgentConfig` records the defaults, but `run(max_turns=3)` overrides them
@@ -121,6 +153,8 @@ def _policy_payload(policy: LoopPolicy, *, streaming: bool) -> dict[str, Any]:
         "tool_choice": choice.mode if choice is not None else None,
         "tool_choice_name": choice.tool_name if choice is not None else None,
         "streaming": streaming,
+        # False = this run started from an empty history (no memory).
+        "retain_history": retain_history,
     }
 
 
@@ -140,6 +174,8 @@ class AgentLoop:
         cost_tracker: CostTracker,
         trace: ExecutionTrace,
         agent_id: str,
+        retain_history: bool = True,
+        native_clearing: bool = False,
     ) -> None:
         self.config = config
         self.provider = provider
@@ -151,6 +187,13 @@ class AgentLoop:
         self.cost = cost_tracker
         self.trace = trace
         self.agent_id = agent_id
+        # False = stateless: each run starts from an empty history.
+        self.retain_history = retain_history
+        # Server-side tool-result clearing; switched off for the rest of the
+        # session if the provider rejects it once.
+        self.native_clearing = native_clearing
+        # The messages the current run appended at its start (see _end_run).
+        self._run_input: list[AnyMessage] = []
         # Concurrent runs would interleave into the same short-term memory.
         self._running = False
 
@@ -163,6 +206,87 @@ class AgentLoop:
             )
         self._running = True
 
+    async def _begin_run(
+        self,
+        user_input: str,
+        memory: ShortTermMemory | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        """Start a run's history: fresh without memory, repaired with it, then
+        this run's memory context, then the user's message. A dry run works
+        on a copy and never summarizes."""
+        memory = memory if memory is not None else self.short_term
+        if not self.retain_history:
+            memory.clear()
+        else:
+            _answer_unanswered_calls(memory)
+        start = len(memory)
+        await self.context.start_run(memory, user_input, dry_run=dry_run)
+        memory.append(UserMessage(content=user_input))
+        if not dry_run:
+            # What this run added; taken back if it never gets a reply.
+            self._run_input = memory.snapshot()[start:]
+
+    def _end_run(self, *, failed: bool) -> bool:
+        """Undo a remembered run that failed before any reply. True if undone.
+
+        A run that failed before the model answered — the prompt would not
+        fit, the provider rejected it — left nothing but its input; kept, an
+        oversized input would make every later run fail the same way. The
+        conversation continues as if the run had not happened. A run the
+        caller stopped (cancelled, stream closed) keeps its input: that
+        message was sent, and is part of the conversation the user saw.
+        """
+        run_input, self._run_input = self._run_input, []
+        if not failed or not self.retain_history or not run_input:
+            return False
+        if self.short_term.last is not run_input[-1]:
+            return False
+        return self.short_term.remove_tail(run_input)
+
+    async def _assemble(self, turn: int) -> AssembledContext:
+        """The view for this run's *turn*-th call. The context manager decides
+        whether it may be trimmed: on a model that binds reasoning to the
+        prefix, only at a run's first call."""
+        return await self.context.assemble(self.short_term, call=turn)
+
+    def _window_exceeded(
+        self, estimated_tokens: int, turn_num: int
+    ) -> ContextWindowExceededError | None:
+        """The pre-flight guard: a prompt that cannot fit is never sent.
+
+        With server-side clearing on, the provider clears the old results
+        again on every call, so the amount it cleared last time does not
+        reach the model either.
+        """
+        usable = self.config.usable_context_tokens
+        cleared = (
+            self.context.provider_cleared_tokens(self.short_term) if self.native_clearing else 0
+        )
+        if estimated_tokens - cleared <= usable:
+            return None
+        self.trace.record_event(
+            EventType.LOOP_GUARD,
+            name="context_exceeded",
+            status=SpanStatus.ERROR,
+            turn_number=turn_num,
+            payload={
+                "estimated_tokens": estimated_tokens,
+                "cleared_by_provider": cleared,
+                "usable_tokens": usable,
+                "max_context_tokens": self.context.max_context_tokens,
+            },
+        )
+        return ContextWindowExceededError(
+            f"the prompt (≈{estimated_tokens} tokens) would not fit the "
+            f"{usable} tokens the context window leaves next to "
+            f"max_tokens_per_response",
+            turn=turn_num,
+            estimated_tokens=estimated_tokens,
+            limit=usable,
+        )
+
     def _tool_choice_for_turn(self, policy: LoopPolicy, turn: int):
         # A forced tool choice only applies to the first LLM call — repeating
         # it on later turns would force the model into an infinite tool loop.
@@ -172,15 +296,91 @@ class AgentLoop:
             return None
         return policy.tool_choice
 
-    def _note_usage(self, usage: TokenUsage) -> float:
+    def _note_usage(self, usage: TokenUsage, applied_edits: list[AppliedEdit]) -> float:
         cost = self.cost.record(self.config.model, usage)
         ctx_actual = (
             usage.input_tokens
             + usage.cache_read_input_tokens
             + usage.cache_creation_input_tokens
         )
-        self.context.note_actual_tokens(ctx_actual)
+        cleared = 0
+        for edit in applied_edits:
+            cleared += edit.cleared_input_tokens
+            self.trace.record_event(
+                EventType.COMPACTION, name="native_clear", payload=edit.to_dict()
+            )
+        # The provider counted the prompt *after* clearing; calibrate against
+        # the prompt that was sent.
+        self.context.note_actual_tokens(ctx_actual, cleared_by_provider=cleared)
         return cost
+
+    # ---------- server-side tool-result clearing ----------
+
+    def _context_edits(self) -> ToolResultClearing | None:
+        if not self.native_clearing:
+            return None
+        limit = self.context.max_context_tokens
+        protected = {ASK_USER_TOOL_NAME} | {
+            t.metadata.name for t in self.tools if not t.metadata.clear_old_results
+        }
+        # Never clear a result the model has not seen yet: keep at least the
+        # whole batch that answers its last message.
+        last = self.short_term.last
+        unseen = len(last.content) if isinstance(last, ToolResultMessage) else 0
+        return ToolResultClearing(
+            trigger_tokens=limit,
+            keep_results=max(self.context.keep_recent_results(), unseen),
+            # Each clear rebuilds the prompt cache: only worth it in bulk.
+            clear_at_least_tokens=max(1, limit // 10),
+            exclude_tools=tuple(sorted(protected)),
+        )
+
+    def _disable_native_clearing(self, exc: ContextEditsRejectedError) -> None:
+        self.native_clearing = False
+        self.trace.record_event(
+            EventType.COMPACTION,
+            name="native_clear",
+            payload={"disabled": True, "reason": str(exc)[:500]},
+        )
+
+    async def _call_provider(self, **request: Any) -> NormalizedResponse:
+        """One provider call, with server-side clearing where available.
+
+        A rejection of the clearing (a gateway that drops the beta, a model
+        without it) is retried once without it and switches it off for the
+        rest of the session.
+        """
+        edits = self._context_edits()
+        if edits is None:
+            return await self.provider.call(**request)
+        try:
+            return await self.provider.call(**request, context_edits=edits)
+        except ContextEditsRejectedError as exc:
+            self._disable_native_clearing(exc)
+            return await self.provider.call(**request)
+
+    async def _stream_provider(self, **request: Any) -> AsyncGenerator[StreamChunk, None]:
+        """`_call_provider` for streaming. A rejection arrives before any
+        chunk, so the retry never duplicates output."""
+        edits = self._context_edits()
+        if edits is None:
+            async with _closing(self.provider.stream(**request)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+            return
+        started = False
+        try:
+            async with _closing(self.provider.stream(**request, context_edits=edits)) as chunks:
+                async for chunk in chunks:
+                    started = True
+                    yield chunk
+        except ContextEditsRejectedError as exc:
+            if started:
+                raise
+            self._disable_native_clearing(exc)
+            async with _closing(self.provider.stream(**request)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
 
     # ===================== non-streaming run =====================
 
@@ -197,9 +397,17 @@ class AgentLoop:
             with self.trace.start_span(
                 EventType.RUN,
                 name="run",
-                payload=_policy_payload(policy, streaming=False),
+                payload=_policy_payload(
+                    policy, streaming=False, retain_history=self.retain_history
+                ),
             ) as run_span:
-                result = await self._run_inner(user_input, policy=policy)
+                result: AgentResult | None = None
+                try:
+                    result = await self._run_inner(user_input, policy=policy)
+                finally:
+                    failed = result is not None and result.error is not None
+                    if self._end_run(failed=failed):
+                        run_span.update(input_rolled_back=True)
                 run_span.update(
                     stop_reason=result.stop_reason.value,
                     turns=result.state.turn,
@@ -221,9 +429,10 @@ class AgentLoop:
         policy: LoopPolicy,
     ) -> AgentResult:
         state = LoopState()
-        self.short_term.append(UserMessage(content=user_input))
+        await self._begin_run(user_input)
 
         stop_reason = StopReason.END_TURN
+        report: ContextReport | None = None
         try:
             while True:
                 # Layer 2: hard iteration ceiling.
@@ -247,13 +456,13 @@ class AgentLoop:
                     name=f"turn[{turn_num}]",
                     turn_number=turn_num,
                 ) as turn_span:
-                    # Context assembly (+ persist LLM-driven compaction).
-                    assembled = await self.context.assemble(
-                        self.short_term.snapshot(),
-                        current_user_input=user_input,
-                    )
-                    if assembled.persist is not None:
-                        self.short_term.replace_all(assembled.persist)
+                    # Render what is sent; trims the history first when the
+                    # prompt has outgrown max_context_tokens.
+                    assembled = await self._assemble(state.turn)
+                    report = _report(assembled, self.context.max_context_tokens, None)
+                    overflow = self._window_exceeded(assembled.estimated_tokens, turn_num)
+                    if overflow is not None:
+                        raise overflow
 
                     # LLM call — nested under the turn span.
                     with self.trace.start_span(
@@ -262,7 +471,7 @@ class AgentLoop:
                         turn_number=turn_num,
                     ) as llm_span:
                         try:
-                            response = await self.provider.call(
+                            response = await self._call_provider(
                                 system=assembled.system_prompt,
                                 messages=assembled.messages,
                                 tools=[t.metadata for t in self.tools],
@@ -294,15 +503,18 @@ class AgentLoop:
                                 state=state,
                                 error=exc,
                                 trace=self.trace,
+                                context=report,
                             )
-                        cost = self._note_usage(response.usage)
+                        cost = self._note_usage(response.usage, response.applied_edits)
                         state.cumulative_cost_usd = self.cost.snapshot()[0]
                         llm_span.set_usage(response.usage, cost)
+                        report = _report(
+                            assembled, self.context.max_context_tokens, response.usage
+                        )
                         llm_span.update(
                             model=self.config.model,
                             stop_reason=response.stop_reason.value,
-                            ctx_tokens=assembled.estimated_tokens,
-                            compaction=assembled.compaction_applied,
+                            **report.to_dict(),
                         )
 
                     # Layer 4: budget guard.
@@ -423,10 +635,15 @@ class AgentLoop:
             return AgentResult(
                 final_message=f"[loop guard: {exc}]",
                 messages=self.short_term.snapshot(),
-                stop_reason=StopReason.ERROR,
+                stop_reason=(
+                    StopReason.CONTEXT_EXCEEDED
+                    if isinstance(exc, ContextWindowExceededError)
+                    else StopReason.ERROR
+                ),
                 state=state,
                 error=exc,
                 trace=self.trace,
+                context=report,
             )
         except asyncio.CancelledError:
             self.trace.record_event(
@@ -450,7 +667,45 @@ class AgentLoop:
             state=state,
             error=None,
             trace=self.trace,
+            context=report,
         )
+
+    # ===================== dry run =====================
+
+    async def dry_run(self, user_input: str, *, policy: LoopPolicy) -> AgentResult:
+        """What the first call of `run(user_input)` would send — without
+        calling the model, summarizing, or saving anything.
+
+        Built on a copy: the stored history and its state are untouched. A
+        stateless agent shows a fresh run, as its next run would be.
+        """
+        self._acquire_run()
+        try:
+            with self.trace.start_span(
+                EventType.RUN,
+                name="run",
+                payload={
+                    **_policy_payload(
+                        policy, streaming=False, retain_history=self.retain_history
+                    ),
+                    "dry_run": True,
+                },
+            ) as run_span:
+                memory = self.short_term.copy() if self.retain_history else ShortTermMemory()
+                await self._begin_run(user_input, memory, dry_run=True)
+                assembled = await self.context.assemble(memory, call=1, dry_run=True)
+                report = _report(assembled, self.context.max_context_tokens, None)
+                run_span.update(stop_reason=StopReason.DRY_RUN.value, **report.to_dict())
+                return AgentResult(
+                    final_message="",
+                    messages=assembled.messages,
+                    stop_reason=StopReason.DRY_RUN,
+                    state=LoopState(),
+                    trace=self.trace,
+                    context=report,
+                )
+        finally:
+            self._running = False
 
     # ===================== streaming run =====================
 
@@ -465,11 +720,14 @@ class AgentLoop:
         # report this run's own numbers; the trace-wide turn counter is
         # cumulative across runs.
         state = LoopState()
+        errored = False
         try:
             with self.trace.start_span(
                 EventType.RUN,
                 name="run",
-                payload=_policy_payload(policy, streaming=True),
+                payload=_policy_payload(
+                    policy, streaming=True, retain_history=self.retain_history
+                ),
             ) as run_span:
                 try:
                     # aclosing: if our consumer closes the stream early, close
@@ -480,6 +738,7 @@ class AgentLoop:
                     ) as chunks:
                         async for chunk in chunks:
                             if chunk.type is StreamChunkType.ERROR:
+                                errored = True
                                 # Streaming reports failure as an ERROR chunk,
                                 # not an AgentResult, so mark the span here.
                                 # Provider chunks are forwarded verbatim, so
@@ -500,6 +759,8 @@ class AgentLoop:
                                 )
                             yield chunk
                 finally:
+                    if self._end_run(failed=errored):
+                        run_span.update(input_rolled_back=True)
                     run_span.update(
                         turns=state.turn,
                         tool_rounds=state.tool_rounds,
@@ -515,7 +776,7 @@ class AgentLoop:
         policy: LoopPolicy,
         state: LoopState,
     ) -> AsyncGenerator[StreamChunk, None]:
-        self.short_term.append(UserMessage(content=user_input))
+        await self._begin_run(user_input)
 
         try:
             while True:
@@ -530,17 +791,24 @@ class AgentLoop:
                 state.turn += 1
                 turn_num = self.trace.bump_turn()
 
-                assembled = await self.context.assemble(
-                    self.short_term.snapshot(),
-                    current_user_input=user_input,
-                )
-                if assembled.persist is not None:
-                    self.short_term.replace_all(assembled.persist)
+                assembled = await self._assemble(state.turn)
+                overflow = self._window_exceeded(assembled.estimated_tokens, turn_num)
+                if overflow is not None:
+                    yield StreamChunk(
+                        StreamChunkType.ERROR,
+                        payload={
+                            "reason": "context_exceeded",
+                            "estimated_tokens": overflow.estimated_tokens,
+                            "limit": overflow.limit,
+                        },
+                    )
+                    return
 
                 tool_calls_this_turn: list[ToolCallRequest] = []
                 text_parts: list[str] = []
                 reasoning_blocks: list[ReasoningContent] = []
                 stop_reason = StopReason.END_TURN
+                call_usage: TokenUsage | None = None
 
                 with self.trace.start_span(
                     EventType.LLM_CALL,
@@ -548,7 +816,7 @@ class AgentLoop:
                     turn_number=turn_num,
                 ) as llm_span:
                     try:
-                        async for chunk in self.provider.stream(
+                        provider_chunks = self._stream_provider(
                             system=assembled.system_prompt,
                             messages=assembled.messages,
                             tools=[t.metadata for t in self.tools],
@@ -558,51 +826,59 @@ class AgentLoop:
                             tool_choice=self._tool_choice_for_turn(policy, state.turn),
                             enable_caching=self.config.enable_prompt_caching,
                             extra=self.config.request_extra or None,
-                        ):
-                            yield chunk
-                            ctype = chunk.type
-                            if ctype == StreamChunkType.TEXT_DELTA:
-                                text_parts.append(chunk.payload.get("text", ""))
-                            elif ctype == StreamChunkType.TOOL_USE_COMPLETE:
-                                tool_calls_this_turn.append(
-                                    ToolCallRequest(
-                                        id=chunk.payload["id"],
-                                        name=chunk.payload["name"],
-                                        arguments=chunk.payload.get("arguments", {}),
-                                    )
-                                )
-                            elif ctype == StreamChunkType.USAGE:
-                                usage = TokenUsage(
-                                    input_tokens=chunk.payload.get("input_tokens", 0),
-                                    output_tokens=chunk.payload.get("output_tokens", 0),
-                                    cache_read_input_tokens=chunk.payload.get(
-                                        "cache_read_input_tokens", 0
-                                    ),
-                                    cache_creation_input_tokens=chunk.payload.get(
-                                        "cache_creation_input_tokens", 0
-                                    ),
-                                )
-                                cost = self._note_usage(usage)
-                                state.cumulative_cost_usd = self.cost.snapshot()[0]
-                                llm_span.set_usage(usage, cost)
-                            elif ctype == StreamChunkType.STOP:
-                                sr = chunk.payload.get("stop_reason", "end_turn")
-                                try:
-                                    stop_reason = StopReason(sr)
-                                except ValueError:
-                                    stop_reason = StopReason.END_TURN
-                                # Preserve reasoning/thinking blocks for round-trip:
-                                # Anthropic rejects the next tool-use turn if the
-                                # prior thinking block was stripped.
-                                for r in chunk.payload.get("reasoning") or []:
-                                    if isinstance(r, dict):
-                                        reasoning_blocks.append(
-                                            ReasoningContent(
-                                                provider=self.provider.name,  # type: ignore[arg-type]
-                                                raw=r,
-                                                text=r.get("thinking") or r.get("text"),
-                                            )
+                        )
+                        async with contextlib.aclosing(provider_chunks) as chunks:
+                            async for chunk in chunks:
+                                yield chunk
+                                ctype = chunk.type
+                                if ctype == StreamChunkType.TEXT_DELTA:
+                                    text_parts.append(chunk.payload.get("text", ""))
+                                elif ctype == StreamChunkType.TOOL_USE_COMPLETE:
+                                    tool_calls_this_turn.append(
+                                        ToolCallRequest(
+                                            id=chunk.payload["id"],
+                                            name=chunk.payload["name"],
+                                            arguments=chunk.payload.get("arguments", {}),
                                         )
+                                    )
+                                elif ctype == StreamChunkType.USAGE:
+                                    usage = TokenUsage(
+                                        input_tokens=chunk.payload.get("input_tokens", 0),
+                                        output_tokens=chunk.payload.get("output_tokens", 0),
+                                        cache_read_input_tokens=chunk.payload.get(
+                                            "cache_read_input_tokens", 0
+                                        ),
+                                        cache_creation_input_tokens=chunk.payload.get(
+                                            "cache_creation_input_tokens", 0
+                                        ),
+                                    )
+                                    edits = [
+                                        AppliedEdit.from_dict(e)
+                                        for e in chunk.payload.get("applied_edits") or []
+                                        if isinstance(e, dict)
+                                    ]
+                                    cost = self._note_usage(usage, edits)
+                                    state.cumulative_cost_usd = self.cost.snapshot()[0]
+                                    llm_span.set_usage(usage, cost)
+                                    call_usage = usage
+                                elif ctype == StreamChunkType.STOP:
+                                    sr = chunk.payload.get("stop_reason", "end_turn")
+                                    try:
+                                        stop_reason = StopReason(sr)
+                                    except ValueError:
+                                        stop_reason = StopReason.END_TURN
+                                    # Preserve reasoning/thinking blocks for round-trip:
+                                    # Anthropic rejects the next tool-use turn if the
+                                    # prior thinking block was stripped.
+                                    for r in chunk.payload.get("reasoning") or []:
+                                        if isinstance(r, dict):
+                                            reasoning_blocks.append(
+                                                ReasoningContent(
+                                                    provider=self.provider.name,  # type: ignore[arg-type]
+                                                    raw=r,
+                                                    text=r.get("thinking") or r.get("text"),
+                                                )
+                                            )
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -624,7 +900,13 @@ class AgentLoop:
                         )
                         return
 
-                    llm_span.update(stop_reason=stop_reason.value)
+                    llm_span.update(
+                        model=self.config.model,
+                        stop_reason=stop_reason.value,
+                        **_report(
+                            assembled, self.context.max_context_tokens, call_usage
+                        ).to_dict(),
+                    )
 
                 # Layer 4: budget guard.
                 if (
@@ -766,13 +1048,15 @@ class AgentLoop:
 
         for tc, t, decision in verdicts:
             if t is None:
+                # Capped like every result: with many MCP tools the list is long.
+                content, _, _ = cap_result_content(
+                    f"Unknown tool `{tc.name}`. Available: {', '.join(self.tools.names)}",
+                    self.executor.result_cap(self._meta_or_synth(tc)),
+                )
                 results_map[tc.id] = ToolResult(
                     tool_use_id=tc.id,
                     name=tc.name,
-                    content=(
-                        f"Unknown tool `{tc.name}`. "
-                        f"Available: {', '.join(self.tools.names)}"
-                    ),
+                    content=content,
                     is_error=True,
                 )
             elif decision.verdict == Verdict.ALLOW:
@@ -817,6 +1101,66 @@ class AgentLoop:
 
 
 # ---- pure helpers ----
+
+def _answer_unanswered_calls(memory: ShortTermMemory) -> None:
+    """Give tool calls left without results a result before going on.
+
+    `complete()` returns tool calls as data without running them, and a
+    response cut off by the context window can end in one. Sending such a
+    call again without its result is rejected by every provider, so a
+    remembered conversation would fail on its next run.
+    """
+    last = memory.last
+    if not isinstance(last, AssistantMessage) or not last.tool_calls:
+        return
+    memory.append(
+        ToolResultMessage(
+            content=[
+                ToolResult(
+                    tool_use_id=tc.id,
+                    name=tc.name,
+                    content="Not executed: this tool call was never run.",
+                    is_error=True,
+                )
+                for tc in last.tool_calls
+            ]
+        )
+    )
+
+
+def _report(assembled: AssembledContext, limit: int, usage: TokenUsage | None) -> ContextReport:
+    return ContextReport(
+        messages_sent=len(assembled.messages),
+        messages_stored=assembled.messages_stored,
+        estimated_tokens=assembled.estimated_tokens,
+        max_context_tokens=limit,
+        cleared_results=assembled.cleared_results,
+        reasoning_dropped=assembled.reasoning_dropped,
+        trimmed=assembled.trim is not None and assembled.trim.applied,
+        filtered=assembled.filtered,
+        input_tokens=usage.input_tokens if usage is not None else 0,
+        cache_read_tokens=usage.cache_read_input_tokens if usage is not None else 0,
+        cache_write_tokens=usage.cache_creation_input_tokens if usage is not None else 0,
+    )
+
+
+@contextlib.asynccontextmanager
+async def _closing(
+    chunks: AsyncIterator[StreamChunk],
+) -> AsyncGenerator[AsyncIterator[StreamChunk], None]:
+    """`contextlib.aclosing` for any adapter stream.
+
+    Closing promptly releases the provider's HTTP stream when the consumer
+    stops early. Adapters normally return async generators, but the
+    interface only promises an async iterator, which may have no `aclose`.
+    """
+    try:
+        yield chunks
+    finally:
+        aclose = getattr(chunks, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
 
 def _call_hash(tc: ToolCallRequest) -> str:
     canonical = json.dumps(tc.arguments, sort_keys=True, default=str, separators=(",", ":"))
