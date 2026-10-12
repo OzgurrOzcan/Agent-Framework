@@ -79,6 +79,12 @@ class ProviderSpec:
     reasoning_binding_exact: tuple[tuple[str, bool], ...] = ()
     reasoning_binding_prefixes: tuple[tuple[str, bool], ...] = ()
     reasoning_binding_default: bool = False
+    # Models that reject a historical assistant tool-call message whose
+    # reasoning was left out (Kimi's `reasoning_content`). Distinct from
+    # binding: such reasoning is not invalidated by editing earlier messages,
+    # it only has to stay — so a trim may still clear results and drop whole
+    # turns, but must not cut reasoning from the turns it keeps.
+    reasoning_required_prefixes: tuple[str, ...] = ()
 
     def prefix_score(self, model: str) -> int:
         """Length of the longest owned prefix matching *model*; 0 if none.
@@ -122,6 +128,10 @@ class ProviderSpec:
             if model.startswith(prefix) and len(prefix) > best_len:
                 best_len, result = len(prefix), binds
         return result
+
+    def requires_reasoning_in_history(self, model: str) -> bool:
+        """True if *model* rejects a kept assistant message whose reasoning was cut."""
+        return any(model.startswith(p) for p in self.reasoning_required_prefixes)
 
 
 # --------------------------------------------------------------------------
@@ -223,6 +233,12 @@ OPENAI = ProviderSpec(
     ),
     # Chat Completions never sends reasoning back, so there is none to bind.
     reasoning_binding_default=False,
+    # Kimi behind this adapter (`openai:kimi-k3` + base_url): its thinking
+    # models return `reasoning_content` and reject a historical tool-call
+    # message without it. Other such endpoints (DeepSeek, a vLLM thinking
+    # model) are not inferable from the id — `keep_reasoning_in_history=True`
+    # on the config names them explicitly.
+    reasoning_required_prefixes=("kimi-",),
 )
 
 

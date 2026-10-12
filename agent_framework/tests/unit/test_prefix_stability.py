@@ -114,6 +114,42 @@ def test_binding_table_covers_the_catalog():
             assert isinstance(spec.binds_reasoning_to_prefix(prefix), bool)
 
 
+def test_required_reasoning_is_the_third_kind():
+    """Kimi neither binds reasoning (editing earlier messages is fine) nor
+    ignores it (a kept tool-call message without it is rejected)."""
+    openai = get_provider("openai")
+    for kimi in ("kimi-k3", "kimi-k2.6", "kimi-k2.7-code"):
+        assert openai.requires_reasoning_in_history(kimi), kimi
+        assert not openai.binds_reasoning_to_prefix(kimi), kimi
+    # Not inferable from the id: the config names those explicitly.
+    for other in ("gpt-5", "o3", "deepseek-reasoner", "qwen/qwen3.8-27b"):
+        assert not openai.requires_reasoning_in_history(other), other
+    assert not get_provider("anthropic").requires_reasoning_in_history("claude-opus-5-5")
+
+
+def test_config_resolves_required_reasoning():
+    kimi = AgentConfig(model="openai:kimi-k3", api_key="k",
+                       base_url="https://api.moonshot.ai/v1", context_window=1_000_000)
+    assert kimi.reasoning_required_in_history
+    assert not kimi.reasoning_binds_to_prefix
+    assert not AgentConfig(model="gpt-5", api_key="k").reasoning_required_in_history
+    # Explicit beats the catalog, both ways.
+    assert AgentConfig(
+        model="openai:deepseek-reasoner", api_key="k", base_url="https://api.deepseek.com",
+        context_window=128_000, keep_reasoning_in_history=True,
+    ).reasoning_required_in_history
+    assert not AgentConfig(
+        model="openai:kimi-k3", api_key="k", base_url="https://api.moonshot.ai/v1",
+        context_window=1_000_000, keep_reasoning_in_history=False,
+    ).reasoning_required_in_history
+    # A bound model's reasoning must go once the prefix changed; keeping it
+    # would hand the model blocks it rejects, so the flag never applies.
+    bound = AgentConfig(model="claude-opus-5-5", api_key="k", keep_reasoning_in_history=True)
+    assert bound.reasoning_binds_to_prefix and not bound.reasoning_required_in_history
+    with pytest.raises(ValueError, match="keep_reasoning_in_history"):
+        AgentConfig(model="gpt-5", api_key="k", keep_reasoning_in_history="yes")  # type: ignore[arg-type]
+
+
 # ---------------- where trims may happen ----------------
 
 async def test_no_mid_run_trim_on_bound_models():

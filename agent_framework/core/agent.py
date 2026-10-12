@@ -317,6 +317,7 @@ class Agent:
             trace=self._trace,
             context_filter=context_filter,
             binds_reasoning=self.config.reasoning_binds_to_prefix,
+            keeps_reasoning=self.config.reasoning_required_in_history,
             model=self.config.model,
             summarizer=self._summarizer,
             usable_tokens=self.config.usable_context_tokens,
@@ -631,7 +632,9 @@ class Agent:
             session = self._session
             try:
                 resumed, reasoning_dropped = await session.load(
-                    self._memory.short_term, self._fingerprint()
+                    self._memory.short_term,
+                    self._fingerprint(),
+                    keep_reasoning=self.config.reasoning_required_in_history,
                 )
             except Exception as exc:
                 self._session_unreadable(exc)
@@ -759,6 +762,7 @@ class Agent:
             ),
             native_tool_result_clearing=self._native_clearing,
             reasoning_binds_to_prefix=self.config.reasoning_binds_to_prefix,
+            reasoning_required_in_history=self.config.reasoning_required_in_history,
             summary_model=self._summary_model if self._summarizer is not None else None,
             context_filter=(
                 getattr(self._context_filter, "__qualname__", type(self._context_filter).__name__)

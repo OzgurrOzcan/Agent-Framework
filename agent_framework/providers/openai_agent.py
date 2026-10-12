@@ -9,6 +9,10 @@ Key mappings:
     provider-neutral, matching Anthropic semantics).
   - Sampling parameters are only sent when explicitly set (reasoning models
     reject non-default temperature).
+  - `reasoning_content` (the de-facto field for exposed reasoning on
+    compatible endpoints: Kimi, DeepSeek, vLLM) → ReasoningContent, and back
+    onto the assistant message when the history is sent again. OpenAI itself
+    never returns it, so requests to OpenAI do not change.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from typing import Any, AsyncIterator
 from agent_framework.core.message import (
     AnyMessage,
     AssistantMessage,
+    ReasoningContent,
     StopReason,
     SystemMessage,
     TokenUsage,
@@ -131,8 +136,15 @@ class OpenAIAdapter(BaseProviderAdapter):
                         }
                         for tc in msg.tool_calls
                     ]
-                # Reasoning is model-internal on Chat Completions; it is not
-                # round-tripped (the Responses API would be needed for that).
+                # OpenAI keeps reasoning server-side and never returns it;
+                # compatible endpoints that expose it (Kimi, DeepSeek) expect
+                # it back on every historical assistant message — Kimi rejects
+                # a tool-call message without it. Only blocks this adapter
+                # produced are forwarded: an Anthropic thinking block has no
+                # meaning here.
+                reasoning = _reasoning_content(msg)
+                if reasoning is not None:
+                    rec["reasoning_content"] = reasoning
                 out.append(rec)
         return out
 
@@ -272,6 +284,7 @@ class OpenAIAdapter(BaseProviderAdapter):
 
         acc = StreamingToolAccumulator()
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         stop_reason: StopReason = StopReason.END_TURN
         usage = TokenUsage()
         # Map index → tool_call_id for proper aggregation.
@@ -287,6 +300,13 @@ class OpenAIAdapter(BaseProviderAdapter):
                     usage = _normalize_usage(u)
                 continue
             delta = choice.delta
+            # Compatible endpoints stream `reasoning_content` ahead of the
+            # answer; the same chunk type the Anthropic adapter emits, so a
+            # live UI needs no provider knowledge.
+            reasoning = getattr(delta, "reasoning_content", None)
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_parts.append(reasoning)
+                yield StreamChunk(StreamChunkType.REASONING_DELTA, payload={"text": reasoning})
             if getattr(delta, "content", None):
                 text_parts.append(delta.content)
                 yield StreamChunk(StreamChunkType.TEXT_DELTA, payload={"text": delta.content})
@@ -331,6 +351,7 @@ class OpenAIAdapter(BaseProviderAdapter):
                 "cache_read_input_tokens": usage.cache_read_input_tokens,
             },
         )
+        reasoning_block = _reasoning_block("".join(reasoning_parts))
         yield StreamChunk(
             StreamChunkType.STOP,
             payload={
@@ -339,6 +360,7 @@ class OpenAIAdapter(BaseProviderAdapter):
                 "tool_calls": [
                     {"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls
                 ],
+                "reasoning": [reasoning_block.raw] if reasoning_block else [],
             },
         )
 
@@ -356,11 +378,14 @@ class OpenAIAdapter(BaseProviderAdapter):
             tool_calls.append(ToolCallRequest(id=tc.id, name=tc.function.name, arguments=args))
         usage = _normalize_usage(getattr(raw, "usage", None))
         stop = _to_stop_reason(getattr(choice, "finish_reason", "stop"))
+        # The SDK keeps fields it does not model, so a compatible endpoint's
+        # `reasoning_content` is reachable; OpenAI's own replies have none.
+        reasoning = _reasoning_block(getattr(msg, "reasoning_content", None))
         return NormalizedResponse(
             assistant_message=AssistantMessage(
                 content=text,
                 tool_calls=tool_calls,
-                reasoning=[],
+                reasoning=[reasoning] if reasoning else [],
                 stop_reason=stop,
                 usage=usage,
             ),
@@ -368,6 +393,27 @@ class OpenAIAdapter(BaseProviderAdapter):
             usage=usage,
             raw=raw,
         )
+
+
+def _reasoning_block(reasoning_content: Any) -> ReasoningContent | None:
+    """The opaque block for a reply's `reasoning_content`, if it carried one."""
+    if not isinstance(reasoning_content, str) or not reasoning_content:
+        return None
+    return ReasoningContent(
+        provider="openai",
+        raw={"reasoning_content": reasoning_content},
+        text=reasoning_content,
+    )
+
+
+def _reasoning_content(msg: AssistantMessage) -> str | None:
+    """What to send back as `reasoning_content`: this adapter's blocks, joined."""
+    parts = [
+        r.raw["reasoning_content"]
+        for r in msg.reasoning
+        if r.provider == "openai" and isinstance(r.raw.get("reasoning_content"), str)
+    ]
+    return "".join(parts) if parts else None
 
 
 def _normalize_usage(u: Any) -> TokenUsage:

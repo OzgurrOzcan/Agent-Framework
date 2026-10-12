@@ -21,7 +21,10 @@ cache is rebuilt once per trim instead of on every call:
      first user message is pinned and the newest three turns always stay.
   3. Reasoning: if 1 or 2 changed anything, reasoning before the current turn
      is left out — models that bind reasoning to the conversation prefix
-     reject it once that prefix changed, and the rest ignore old reasoning.
+     reject it once that prefix changed, and most others ignore old
+     reasoning. Not on a model that *requires* it (Kimi: a kept tool-call
+     message without its reasoning is rejected, editing earlier messages is
+     fine) — there steps 1 and 2 do all the trimming.
 
 Afterwards the view only grows again. A trim that cannot get usefully below
 the limit (a huge current turn or pinned message) changes nothing, and is
@@ -251,6 +254,7 @@ class ContextManager:
         trace: ExecutionTrace | None = None,
         context_filter: ContextFilter | None = None,
         binds_reasoning: bool = False,
+        keeps_reasoning: bool = False,
         model: str = "",
         summarizer: Summarizer | None = None,
         usable_tokens: int | None = None,
@@ -284,6 +288,10 @@ class ContextManager:
         # Reasoning is invalidated by editing earlier messages: nothing
         # already sent may change mid-run, so trims wait for a run's start.
         self._binds_reasoning = binds_reasoning
+        # The opposite case: reasoning is not invalidated by a trim but a
+        # kept tool-call message without it is rejected (Kimi), so a trim
+        # clears results and drops turns but never cuts reasoning.
+        self._keeps_reasoning = keeps_reasoning and not binds_reasoning
         self._model = model
         # What the last call actually sent, and the view it was made from —
         # with a filter, the two differ, and the sent one is what the
@@ -805,12 +813,15 @@ class ContextManager:
         )
 
         # Whatever changes from here on, reasoning before the current turn goes
-        # with it: its signatures cover the prefix being edited.
+        # with it: its signatures cover the prefix being edited — unless the
+        # model wants its reasoning kept, where it is not bound to the prefix
+        # but a kept tool-call message without it is rejected.
         # A copy, so whatever else the state carries (summary, pending
         # summaries) survives the trim.
         candidate = state.copy()
         candidate.cleared_results = cleared_zone
-        candidate.reasoning_cut = max(state.reasoning_cut, current_turn)
+        if not self._keeps_reasoning:
+            candidate.reasoning_cut = max(state.reasoning_cut, current_turn)
         tokens = [estimate_message_tokens(m) for m in self._render_history(history, candidate)]
         suffix = [0] * (len(tokens) + 1)
         for i in range(len(tokens) - 1, -1, -1):
